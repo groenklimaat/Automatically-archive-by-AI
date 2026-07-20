@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║           UNIVERSELE BESTANDSARCHIVER - Automatische Sortering              ║
+║          Veilig · Geen automatisch verwijderen · Alleen met toestemming      ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import shutil
+import json
+import threading
+import time
+import hashlib
+import sys
+import stat
+from pathlib import Path
+from datetime import datetime
+from tkinter import *
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Any
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import getpass
+import platform
+
+# ============================================================================
+# PLATFORM DETECTIE
+# ============================================================================
+
+SYSTEM = platform.system()
+IS_WINDOWS = SYSTEM == "Windows"
+IS_LINUX = SYSTEM == "Linux"
+IS_MAC = SYSTEM == "Darwin"
+
+
+# ============================================================================
+# CATEGORIEËN
+# ============================================================================
+
+class FileCategory(Enum):
+    DOCUMENTS = "Documenten"
+    SPREADSHEETS = "Spreadsheets"
+    PRESENTATIONS = "Presentaties"
+    PDF = "PDF"
+    TEXT = "Tekst"
+    IMAGES = "Afbeeldingen"
+    VIDEOS = "Video's"
+    AUDIO = "Muziek"
+    SOURCE_CODE = "Broncode"
+    SCRIPTS = "Scripts"
+    WEB = "Web"
+    DATABASES = "Databases"
+    CONFIG = "Configuratie"
+    SYSTEM = "Systeem"
+    TEMP = "Tijdelijk"
+    BACKUP = "Backups"
+    LOGS = "Logs"
+    ARCHIVES = "Archieven"
+    EXECUTABLES = "Uitvoerbaar"
+    INSTALLERS = "Installatie"
+    DOWNLOADS = "Downloads"
+    DESKTOP = "Bureaublad"
+    OTHER = "Overig"
+    UNKNOWN = "Onbekend"
+
+
+# ============================================================================
+# CONFIGURATIE - STANDAARD VEILIG
+# ============================================================================
+
+@dataclass
+class ArchiveSettings:
+    """Instellingen - Standaard veilig (geen automatisch verwijderen)"""
+    source_folders: List[str] = field(default_factory=list)
+    archive_folder: str = ""
+    
+    # Sortering - AUTOMATISCH AAN
+    organize_by_category: bool = True      # ✅ Automatisch sorteren op categorie
+    organize_by_date: bool = True          # ✅ Automatisch sorteren op datum
+    organize_by_type: bool = False         # Optioneel
+    
+    # Veiligheidsinstellingen
+    include_hidden: bool = False           # ❌ Verborgen bestanden overslaan
+    include_system: bool = False           # ❌ Systeembestanden overslaan
+    detect_duplicates: bool = True         # ✅ Duplicaten detecteren
+    duplicate_action: str = "rename"       # ✅ Herbenoemen ipv verwijderen
+    
+    # ⚠️ CRUCIAAL: Verwijderen standaard UIT
+    delete_original: bool = False          # ❌ NIET automatisch verwijderen!
+    dry_run: bool = False                  # ❌ Niet in dry-run modus
+    
+    # Prestaties
+    use_multithreading: bool = True
+    max_workers: int = 4
+    max_depth: int = 20
+    max_size_mb: int = 10240               # 10GB
+
+
+# ============================================================================
+# BESTANDSANALYSATOR
+# ============================================================================
+
+class FileAnalyzer:
+    EXTENSION_CATEGORIES = {
+        '.doc': FileCategory.DOCUMENTS, '.docx': FileCategory.DOCUMENTS,
+        '.odt': FileCategory.DOCUMENTS, '.rtf': FileCategory.DOCUMENTS,
+        '.xls': FileCategory.SPREADSHEETS, '.xlsx': FileCategory.SPREADSHEETS,
+        '.ods': FileCategory.SPREADSHEETS, '.csv': FileCategory.SPREADSHEETS,
+        '.ppt': FileCategory.PRESENTATIONS, '.pptx': FileCategory.PRESENTATIONS,
+        '.odp': FileCategory.PRESENTATIONS,
+        '.pdf': FileCategory.PDF,
+        '.txt': FileCategory.TEXT, '.md': FileCategory.TEXT,
+        '.jpg': FileCategory.IMAGES, '.jpeg': FileCategory.IMAGES,
+        '.png': FileCategory.IMAGES, '.gif': FileCategory.IMAGES,
+        '.bmp': FileCategory.IMAGES, '.tiff': FileCategory.IMAGES,
+        '.svg': FileCategory.IMAGES, '.ico': FileCategory.IMAGES,
+        '.webp': FileCategory.IMAGES, '.psd': FileCategory.IMAGES,
+        '.mp4': FileCategory.VIDEOS, '.avi': FileCategory.VIDEOS,
+        '.mkv': FileCategory.VIDEOS, '.mov': FileCategory.VIDEOS,
+        '.wmv': FileCategory.VIDEOS, '.flv': FileCategory.VIDEOS,
+        '.webm': FileCategory.VIDEOS, '.m4v': FileCategory.VIDEOS,
+        '.mpg': FileCategory.VIDEOS, '.mpeg': FileCategory.VIDEOS,
+        '.mp3': FileCategory.AUDIO, '.wav': FileCategory.AUDIO,
+        '.flac': FileCategory.AUDIO, '.aac': FileCategory.AUDIO,
+        '.ogg': FileCategory.AUDIO, '.wma': FileCategory.AUDIO,
+        '.m4a': FileCategory.AUDIO, '.aiff': FileCategory.AUDIO,
+        '.py': FileCategory.SOURCE_CODE, '.pyw': FileCategory.SOURCE_CODE,
+        '.java': FileCategory.SOURCE_CODE, '.c': FileCategory.SOURCE_CODE,
+        '.cpp': FileCategory.SOURCE_CODE, '.h': FileCategory.SOURCE_CODE,
+        '.cs': FileCategory.SOURCE_CODE, '.vb': FileCategory.SOURCE_CODE,
+        '.go': FileCategory.SOURCE_CODE, '.rs': FileCategory.SOURCE_CODE,
+        '.swift': FileCategory.SOURCE_CODE, '.kt': FileCategory.SOURCE_CODE,
+        '.sh': FileCategory.SCRIPTS, '.bash': FileCategory.SCRIPTS,
+        '.ps1': FileCategory.SCRIPTS, '.vbs': FileCategory.SCRIPTS,
+        '.bat': FileCategory.SCRIPTS, '.cmd': FileCategory.SCRIPTS,
+        '.js': FileCategory.SCRIPTS, '.ts': FileCategory.SCRIPTS,
+        '.rb': FileCategory.SCRIPTS, '.pl': FileCategory.SCRIPTS,
+        '.html': FileCategory.WEB, '.htm': FileCategory.WEB,
+        '.css': FileCategory.WEB, '.scss': FileCategory.WEB,
+        '.php': FileCategory.WEB, '.asp': FileCategory.WEB,
+        '.jsp': FileCategory.WEB, '.xml': FileCategory.WEB,
+        '.json': FileCategory.WEB, '.yaml': FileCategory.WEB,
+        '.yml': FileCategory.WEB, '.toml': FileCategory.WEB,
+        '.sql': FileCategory.DATABASES, '.db': FileCategory.DATABASES,
+        '.sqlite': FileCategory.DATABASES, '.sqlite3': FileCategory.DATABASES,
+        '.mdb': FileCategory.DATABASES, '.accdb': FileCategory.DATABASES,
+        '.cfg': FileCategory.CONFIG, '.conf': FileCategory.CONFIG,
+        '.ini': FileCategory.CONFIG, '.env': FileCategory.CONFIG,
+        '.log': FileCategory.LOGS, '.out': FileCategory.LOGS,
+        '.zip': FileCategory.ARCHIVES, '.rar': FileCategory.ARCHIVES,
+        '.7z': FileCategory.ARCHIVES, '.tar': FileCategory.ARCHIVES,
+        '.gz': FileCategory.ARCHIVES, '.bz2': FileCategory.ARCHIVES,
+        '.xz': FileCategory.ARCHIVES, '.tgz': FileCategory.ARCHIVES,
+        '.exe': FileCategory.EXECUTABLES, '.msi': FileCategory.INSTALLERS,
+        '.dmg': FileCategory.INSTALLERS, '.pkg': FileCategory.INSTALLERS,
+        '.deb': FileCategory.INSTALLERS, '.rpm': FileCategory.INSTALLERS,
+        '.app': FileCategory.EXECUTABLES, '.AppImage': FileCategory.EXECUTABLES,
+    }
+
+    def analyze_file(self, filepath: Path) -> Optional[Dict[str, Any]]:
+        try:
+            if not filepath.exists():
+                return None
+            
+            stat_info = filepath.stat()
+            size_bytes = stat_info.st_size
+            name = filepath.name
+            extension = filepath.suffix.lower()
+            
+            category = self._determine_category(filepath, extension)
+            is_hidden = name.startswith('.')
+            is_system = self._is_system_file(filepath)
+            
+            checksum = None
+            if size_bytes < 50 * 1024 * 1024:
+                checksum = self._calculate_md5(filepath)
+            
+            return {
+                'path': filepath,
+                'name': name,
+                'extension': extension,
+                'size_bytes': size_bytes,
+                'size_mb': size_bytes / (1024 * 1024),
+                'category': category,
+                'is_hidden': is_hidden,
+                'is_system': is_system,
+                'checksum': checksum,
+                'modified': datetime.fromtimestamp(stat_info.st_mtime),
+                'created': datetime.fromtimestamp(stat_info.st_ctime),
+                'parent': filepath.parent.name
+            }
+        except Exception:
+            return None
+
+    def _determine_category(self, filepath: Path, extension: str) -> FileCategory:
+        path_str = str(filepath).lower()
+        name = filepath.name.lower()
+        
+        path_patterns = {
+            FileCategory.DOCUMENTS: ['/documents', '/documenten', '/docs'],
+            FileCategory.IMAGES: ['/images', '/afbeeldingen', '/pictures', '/photos'],
+            FileCategory.VIDEOS: ['/videos', '/video', '/movies', '/films'],
+            FileCategory.AUDIO: ['/music', '/muziek', '/audio', '/songs'],
+            FileCategory.SOURCE_CODE: ['/src', '/source', '/code', '/development'],
+            FileCategory.DATABASES: ['/databases', '/db', '/sql'],
+            FileCategory.CONFIG: ['/config', '/configuration', '/settings'],
+            FileCategory.LOGS: ['/logs', '/log'],
+            FileCategory.BACKUP: ['/backup', '/back-ups', '/backups'],
+            FileCategory.TEMP: ['/temp', '/tmp', '/cache'],
+            FileCategory.DOWNLOADS: ['/downloads', '/download'],
+            FileCategory.DESKTOP: ['/desktop', '/bureaublad'],
+        }
+        
+        for category, patterns in path_patterns.items():
+            for pattern in patterns:
+                if pattern in path_str:
+                    return category
+        
+        name_patterns = {
+            FileCategory.BACKUP: ['backup', 'back-up', 'copy_'],
+            FileCategory.TEMP: ['temp_', 'tmp_', 'cache_', '~'],
+            FileCategory.LOGS: ['.log', '_log', 'log_'],
+        }
+        
+        for category, patterns in name_patterns.items():
+            for pattern in patterns:
+                if pattern in name:
+                    return category
+        
+        if extension in self.EXTENSION_CATEGORIES:
+            return self.EXTENSION_CATEGORIES[extension]
+        
+        if '.' not in name:
+            if IS_LINUX or IS_MAC:
+                if os.access(filepath, os.X_OK):
+                    return FileCategory.EXECUTABLES
+        
+        return FileCategory.UNKNOWN
+
+    def _is_system_file(self, filepath: Path) -> bool:
+        path_str = str(filepath).lower()
+        name = filepath.name.lower()
+        
+        system_paths = [
+            '/windows/', '/system32/', '/program files/',
+            '/programdata/', '/system volume information/',
+            '/$recycle.bin/', '/etc/', '/bin/', '/sbin/',
+            '/usr/bin/', '/usr/sbin/', '/proc/', '/sys/',
+            '/dev/', '/boot/', '/lib/'
+        ]
+        
+        for sys_path in system_paths:
+            if sys_path in path_str:
+                return True
+        
+        system_files = [
+            'pagefile.sys', 'hiberfil.sys', 'swapfile.sys',
+            'ntuser.dat', 'boot.ini', 'ntldr',
+            '.bashrc', '.profile', '.bash_history'
+        ]
+        
+        return name in system_files
+
+    def _calculate_md5(self, filepath: Path) -> str:
+        try:
+            md5_hash = hashlib.md5()
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    md5_hash.update(chunk)
+            return md5_hash.hexdigest()
+        except:
+            return ""
+
+
+# ============================================================================
+# ARCHIVER - VEILIG (GEEN AUTOMATISCH VERWIJDEREN)
+# ============================================================================
+
+class Archiver:
+    def __init__(self, settings: ArchiveSettings):
+        self.settings = settings
+        self.analyzer = FileAnalyzer()
+        self.archive_path = Path(settings.archive_folder)
+        
+        self.stats = {
+            'total_scanned': 0,
+            'total_size_mb': 0,
+            'archived': 0,
+            'archived_size_mb': 0,
+            'duplicates': 0,
+            'errors': 0,
+            'skipped': 0,
+            'categories': {},
+            'extensions': {},
+            'error_details': [],
+            'start_time': None,
+            'end_time': None,
+            'elapsed_seconds': 0
+        }
+        
+        self.processed_checksums: Set[str] = set()
+
+    def scan_folder(self, folder_path: Path, log_callback=None) -> List[Path]:
+        files = []
+        if not folder_path.exists():
+            if log_callback:
+                log_callback(f"❌ Map bestaat niet: {folder_path}")
+            return files
+        
+        try:
+            for root, dirs, filenames in os.walk(folder_path):
+                current_depth = len(Path(root).relative_to(folder_path).parts)
+                if self.settings.max_depth > 0 and current_depth >= self.settings.max_depth:
+                    dirs.clear()
+                    continue
+                
+                if not self.settings.include_hidden:
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                
+                for filename in filenames:
+                    filepath = Path(root) / filename
+                    
+                    if not self.settings.include_hidden and filename.startswith('.'):
+                        continue
+                    
+                    if not self.settings.include_system:
+                        if self.analyzer._is_system_file(filepath):
+                            continue
+                    
+                    try:
+                        size = filepath.stat().st_size
+                        if size > self.settings.max_size_mb * 1024 * 1024:
+                            continue
+                    except:
+                        continue
+                    
+                    files.append(filepath)
+        except Exception as e:
+            if log_callback:
+                log_callback(f"⚠️ Fout bij scannen: {e}")
+        
+        return files
+
+    def process_file(self, filepath: Path, log_callback=None) -> bool:
+        try:
+            file_info = self.analyzer.analyze_file(filepath)
+            if not file_info:
+                self.stats['skipped'] += 1
+                return False
+            
+            self.stats['total_scanned'] += 1
+            self.stats['total_size_mb'] += file_info['size_mb']
+            
+            category_name = file_info['category'].value
+            self.stats['categories'][category_name] = self.stats['categories'].get(category_name, 0) + 1
+            
+            ext = file_info['extension'] or "Geen_extensie"
+            self.stats['extensions'][ext] = self.stats['extensions'].get(ext, 0) + 1
+            
+            # Duplicaat detectie - hernoemen ipv verwijderen
+            if self.settings.detect_duplicates and file_info['checksum']:
+                checksum = file_info['checksum']
+                if checksum in self.processed_checksums:
+                    self.stats['duplicates'] += 1
+                    if self.settings.duplicate_action == "skip":
+                        return False
+                    # Bij "rename" wordt het bestand later hernoemd
+                else:
+                    self.processed_checksums.add(checksum)
+            
+            # Bepaal doelpad (automatische sortering)
+            dest_path = self._determine_destination(file_info)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Als bestand al bestaat, voeg timestamp toe (veilig hernoemen)
+            if dest_path.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dest_path = dest_path.parent / f"{dest_path.stem}_{timestamp}{dest_path.suffix}"
+                if log_callback:
+                    log_callback(f"📝 Bestand hernoemd (duplicaat): {file_info['name']} -> {dest_path.name}")
+            
+            if self.settings.dry_run:
+                if log_callback:
+                    log_callback(f"🔍 [DRY RUN] {filepath.name} -> {dest_path}")
+                self.stats['archived'] += 1
+                self.stats['archived_size_mb'] += file_info['size_mb']
+                return True
+            
+            # KOPIEER het bestand (origineel blijft staan)
+            try:
+                shutil.copy2(str(filepath), str(dest_path))
+                
+                # ⚠️ ALLEEN VERWIJDEREN ALS EXPLICIET TOEGESTAAN
+                if self.settings.delete_original:
+                    if log_callback:
+                        log_callback(f"🗑️ Origineel verwijderd (toegestaan): {filepath.name}")
+                    os.remove(filepath)
+                else:
+                    if log_callback:
+                        log_callback(f"✅ Gekopieerd (origineel behouden): {filepath.name} -> {dest_path}")
+                    
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"⚠️ Fout bij kopiëren: {filepath.name} - {e}")
+                self.stats['errors'] += 1
+                self.stats['error_details'].append(f"{filepath.name}: {e}")
+                return False
+            
+            self.stats['archived'] += 1
+            self.stats['archived_size_mb'] += file_info['size_mb']
+            return True
+            
+        except Exception as e:
+            error_msg = f"❌ Fout bij {filepath.name}: {str(e)}"
+            self.stats['errors'] += 1
+            self.stats['error_details'].append(error_msg)
+            if log_callback:
+                log_callback(error_msg)
+            return False
+
+    def _determine_destination(self, file_info: Dict) -> Path:
+        """Automatisch de juiste map bepalen op basis van categorie en datum"""
+        base = self.archive_path
+        
+        # ✅ AUTOMATISCH SORTEREN OP CATEGORIE
+        if self.settings.organize_by_category:
+            base = base / file_info['category'].value
+        
+        # ✅ AUTOMATISCH SORTEREN OP TYPE
+        if self.settings.organize_by_type:
+            file_type = file_info['extension'][1:].upper() if file_info['extension'] else "Onbekend"
+            if file_type != "Geen_extensie":
+                base = base / file_type
+        
+        # ✅ AUTOMATISCH SORTEREN OP DATUM
+        if self.settings.organize_by_date:
+            modified = file_info['modified']
+            base = base / str(modified.year) / f"{modified.month:02d}"
+        
+        return base / file_info['name']
+
+    def archive_all(self, log_callback=None) -> bool:
+        self.stats['start_time'] = datetime.now()
+        
+        if log_callback:
+            log_callback("=" * 70)
+            log_callback("🚀 UNIVERSELE BESTANDSARCHIVER - VEILIGE MODUS")
+            log_callback("=" * 70)
+            log_callback(f"📅 Start: {self.stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+            log_callback(f"💻 Platform: {platform.system()}")
+            log_callback(f"👤 Gebruiker: {getpass.getuser()}")
+            log_callback(f"🔒 Verwijderen: {'AAN' if self.settings.delete_original else 'UIT (veilig)'}")
+            log_callback("=" * 70)
+        
+        all_files = []
+        for folder in self.settings.source_folders:
+            folder_path = Path(folder)
+            if not folder_path.exists():
+                if log_callback:
+                    log_callback(f"⚠️ Bronmap bestaat niet: {folder}")
+                continue
+            files = self.scan_folder(folder_path, log_callback)
+            all_files.extend(files)
+            if log_callback:
+                log_callback(f"📊 {folder}: {len(files)} bestanden gevonden")
+        
+        if not all_files:
+            if log_callback:
+                log_callback("📭 Geen bestanden gevonden")
+            return False
+        
+        if log_callback:
+            total_size_gb = sum(f.stat().st_size for f in all_files) / (1024 ** 3)
+            log_callback(f"\n📦 {len(all_files)} bestanden gevonden")
+            log_callback(f"📊 Totaal grootte: {total_size_gb:.2f} GB")
+            log_callback(f"📂 Automatische sortering: Categorieën + Datum")
+            log_callback("🔍 Bestanden kopiëren...")
+            log_callback("=" * 70)
+        
+        processed = 0
+        if self.settings.use_multithreading:
+            with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
+                futures = []
+                for filepath in all_files:
+                    future = executor.submit(self.process_file, filepath, log_callback)
+                    futures.append(future)
+                
+                for future in as_completed(futures):
+                    processed += 1
+                    if log_callback and processed % 100 == 0:
+                        log_callback(f"✅ {processed} bestanden verwerkt...")
+        else:
+            for filepath in all_files:
+                self.process_file(filepath, log_callback)
+                processed += 1
+                if log_callback and processed % 100 == 0:
+                    log_callback(f"✅ {processed} bestanden verwerkt...")
+        
+        self.stats['end_time'] = datetime.now()
+        self.stats['elapsed_seconds'] = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
+        
+        if log_callback:
+            log_callback("\n" + "=" * 70)
+            log_callback("✨ ARCHIVERING VOLTOOID!")
+            log_callback("=" * 70)
+            log_callback(f"📁 Gescand: {self.stats['total_scanned']}")
+            log_callback(f"✅ Gearchiveerd: {self.stats['archived']}")
+            log_callback(f"🔄 Duplicaten: {self.stats['duplicates']}")
+            log_callback(f"⏭️ Overgeslagen: {self.stats['skipped']}")
+            log_callback(f"❌ Fouten: {self.stats['errors']}")
+            log_callback(f"📊 Totaal: {self.stats['total_size_mb'] / 1024:.2f} GB")
+            log_callback(f"📊 Gearchiveerd: {self.stats['archived_size_mb'] / 1024:.2f} GB")
+            log_callback(f"🔒 Originele bestanden: {'VERWIJDERD' if self.settings.delete_original else 'BEWAARD (veilig)'}")
+            
+            hours = int(self.stats['elapsed_seconds'] // 3600)
+            minutes = int((self.stats['elapsed_seconds'] % 3600) // 60)
+            seconds = int(self.stats['elapsed_seconds'] % 60)
+            log_callback(f"⏱️ Tijd: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            
+            if self.stats['categories']:
+                log_callback("\n📂 CATEGORIEËN (automatisch gesorteerd):")
+                for cat, count in sorted(self.stats['categories'].items(), key=lambda x: x[1], reverse=True)[:10]:
+                    log_callback(f"  {cat}: {count} bestanden")
+        
+        return True
+
+
+# ============================================================================
+# GUI APPLICATIE - VEILIGE STANDAARDINSTELLINGEN
+# ============================================================================
+
+class ArchiverApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"📦 Bestandsarchiver - Veilige Modus")
+        self.root.geometry("1000x850")
+        self.root.resizable(True, True)
+        
+        self.settings = ArchiveSettings()
+        self.running = False
+        self.archiver = None
+        self.settings_file = Path.home() / ".archiver_settings_safe.json"
+        
+        self._setup_ui()
+        self._load_settings()
+        
+        # Toon veiligheidswaarschuwing
+        self._show_safety_notice()
+    
+    def _show_safety_notice(self):
+        """Toon veiligheidswaarschuwing bij opstarten"""
+        msg = """🔒 VEILIGHEIDSINFORMATIE
+
+✓ Bestanden worden standaard GEKOPIEERD (niet verwijderd)
+✓ Originele bestanden blijven op hun plek staan
+✓ Bestanden worden automatisch gesorteerd in mappen:
+  • Op categorie (Documenten, Afbeeldingen, Video's, etc.)
+  • Op datum (Jaar/Maand)
+✓ Duplicaten worden herkend en hernoemd
+
+⚠️ Wil je originele bestanden verwijderen?
+  • Vink dan '🗑️ Verwijder origineel' aan
+  • Dit doe je op eigen risico!
+
+Klik OK om te beginnen met sorteren."""
+        
+        messagebox.showinfo("🔒 Veilige Modus Actief", msg)
+    
+    def _setup_ui(self):
+        main = ttk.Frame(self.root, padding="10")
+        main.grid(row=0, column=0, sticky=(N, W, E, S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(5, weight=1)
+        
+        # Titel met veiligheidsindicatie
+        title = ttk.Frame(main)
+        title.grid(row=0, column=0, pady=(0, 10))
+        ttk.Label(title, text=f"📦 UNIVERSELE BESTANDSARCHIVER", font=("Arial", 16, "bold")).pack()
+        ttk.Label(title, text=f"🔒 Veilige Modus - Bestanden worden gekopieerd, niet verwijderd", 
+                 font=("Arial", 10), foreground="green").pack()
+        ttk.Label(title, text=f"Automatische sortering op categorie + datum · {platform.system()}", 
+                 font=("Arial", 9)).pack()
+        
+        # Configuratie
+        cfg = ttk.LabelFrame(main, text="📁 Configuratie", padding="10")
+        cfg.grid(row=1, column=0, sticky=(W, E), pady=5)
+        cfg.columnconfigure(1, weight=1)
+        
+        # Bronmappen
+        ttk.Label(cfg, text="📂 Bronmappen (te sorteren):").grid(row=0, column=0, sticky=W, pady=2)
+        
+        source_frame = ttk.Frame(cfg)
+        source_frame.grid(row=1, column=0, columnspan=3, sticky=(W, E), pady=2)
+        source_frame.columnconfigure(0, weight=1)
+        
+        self.source_listbox = Listbox(source_frame, height=4, selectmode=EXTENDED)
+        self.source_listbox.grid(row=0, column=0, sticky=(W, E), padx=(0, 5))
+        
+        source_btn_frame = ttk.Frame(source_frame)
+        source_btn_frame.grid(row=0, column=1, sticky=N)
+        ttk.Button(source_btn_frame, text="➕ Map", command=self._add_source, width=10).pack(pady=1)
+        ttk.Button(source_btn_frame, text="🏠 Home", command=self._add_home, width=10).pack(pady=1)
+        ttk.Button(source_btn_frame, text="❌ Verwijder", command=self._remove_source, width=10).pack(pady=1)
+        
+        # Doelmap
+        ttk.Label(cfg, text="📀 Archiefmap (doel):").grid(row=2, column=0, sticky=W, pady=(10, 2))
+        self.archive_entry = ttk.Entry(cfg)
+        self.archive_entry.grid(row=2, column=1, sticky=(W, E), padx=5, pady=(10, 2))
+        ttk.Button(cfg, text="Bladeren", command=self._select_archive).grid(row=2, column=2, pady=(10, 2))
+        
+        # Sorteeropties (automatisch aan)
+        sort_frame = ttk.LabelFrame(cfg, text="📂 Automatische Sortering", padding="5")
+        sort_frame.grid(row=3, column=0, columnspan=3, sticky=W, pady=(10, 0))
+        
+        self.category_var = BooleanVar(value=True)
+        ttk.Checkbutton(sort_frame, text="✅ Op Categorie (Documenten, Afbeeldingen, etc.)", 
+                       variable=self.category_var).pack(anchor=W)
+        
+        self.date_var = BooleanVar(value=True)
+        ttk.Checkbutton(sort_frame, text="✅ Op Datum (Jaar/Maand)", 
+                       variable=self.date_var).pack(anchor=W)
+        
+        self.type_var = BooleanVar(value=False)
+        ttk.Checkbutton(sort_frame, text="Op Bestandstype", 
+                       variable=self.type_var).pack(anchor=W)
+        
+        # Veiligheidsopties
+        safety_frame = ttk.LabelFrame(cfg, text="🔒 Veiligheidsinstellingen", padding="5")
+        safety_frame.grid(row=4, column=0, columnspan=3, sticky=W, pady=(10, 0))
+        
+        self.hidden_var = BooleanVar(value=False)
+        ttk.Checkbutton(safety_frame, text="👁️ Verborgen bestanden meenemen", 
+                       variable=self.hidden_var).pack(anchor=W)
+        
+        self.duplicates_var = BooleanVar(value=True)
+        ttk.Checkbutton(safety_frame, text="🔄 Duplicaten detecteren en hernoemen", 
+                       variable=self.duplicates_var).pack(anchor=W)
+        
+        # ⚠️ CRUCIAAL: Verwijderen standaard UIT - met duidelijke waarschuwing
+        delete_frame = ttk.Frame(safety_frame)
+        delete_frame.pack(anchor=W, pady=(5, 0))
+        
+        self.delete_orig_var = BooleanVar(value=False)  # Standaard UIT!
+        delete_check = ttk.Checkbutton(delete_frame, text="⚠️ VERWIJDER ORIGINELE BESTANDEN", 
+                                       variable=self.delete_orig_var)
+        delete_check.pack(side=LEFT)
+        
+        ttk.Label(delete_frame, text="(Standaard UIT - alleen aanzetten als je zeker weet wat je doet!)", 
+                 foreground="red", font=("Arial", 8)).pack(side=LEFT, padx=5)
+        
+        # Status
+        self.status_label = ttk.Label(cfg, text="🟢 Klaar - Veilige modus actief", foreground="green")
+        self.status_label.grid(row=5, column=0, columnspan=3, sticky=W, pady=(10, 0))
+        
+        # Knoppen
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=2, column=0, pady=10)
+        
+        self.start_btn = ttk.Button(btn_frame, text="▶ Start Sorteren", command=self._start_archive)
+        self.start_btn.grid(row=0, column=0, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="⏹ Stop", command=self._stop_archive, state=DISABLED)
+        self.stop_btn.grid(row=0, column=1, padx=5)
+        
+        ttk.Button(btn_frame, text="💾 Opslaan", command=self._save_settings).grid(row=0, column=2, padx=5)
+        ttk.Button(btn_frame, text="📊 Stats", command=self._show_stats).grid(row=0, column=3, padx=5)
+        ttk.Button(btn_frame, text="🧹 Clear", command=self._clear_log).grid(row=0, column=4, padx=5)
+        
+        # Logboek
+        log_frame = ttk.LabelFrame(main, text="📋 Logboek", padding="5")
+        log_frame.grid(row=3, column=0, sticky=(N, W, E, S), pady=10)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+        
+        log_controls = ttk.Frame(log_frame)
+        log_controls.grid(row=0, column=0, sticky=W, pady=(0, 5))
+        ttk.Button(log_controls, text="🗑 Wissen", command=self._clear_log).pack(side=LEFT, padx=2)
+        ttk.Button(log_controls, text="📋 Kopieer", command=self._copy_log).pack(side=LEFT, padx=2)
+        
+        self.safety_indicator = ttk.Label(log_controls, text="🔒 Veilig - Kopiëren (geen verwijdering)", 
+                                         foreground="green")
+        self.safety_indicator.pack(side=LEFT, padx=10)
+        
+        self.status_display = ttk.Label(log_controls, text="📊 Status: Wachtend", foreground="blue")
+        self.status_display.pack(side=LEFT, padx=10)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=20, font=("Courier", 9))
+        self.log_text.grid(row=1, column=0, sticky=(N, W, E, S))
+        
+        # Tags voor kleurcodering
+        self.log_text.tag_configure("success", foreground="green")
+        self.log_text.tag_configure("error", foreground="red")
+        self.log_text.tag_configure("warning", foreground="orange")
+        self.log_text.tag_configure("info", foreground="blue")
+        self.log_text.tag_configure("category", foreground="darkgreen")
+        self.log_text.tag_configure("safety", foreground="green")
+    
+    def _log(self, msg, tag=None):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {msg}\n"
+        
+        if tag:
+            self.log_text.insert(END, formatted, tag)
+        else:
+            if "✅" in msg:
+                self.log_text.insert(END, formatted, "success")
+            elif "❌" in msg:
+                self.log_text.insert(END, formatted, "error")
+            elif "⚠️" in msg:
+                self.log_text.insert(END, formatted, "warning")
+            elif "🔒" in msg:
+                self.log_text.insert(END, formatted, "safety")
+            elif any(cat in msg for cat in ["Documenten", "Afbeeldingen", "Video", "Muziek"]):
+                self.log_text.insert(END, formatted, "category")
+            else:
+                self.log_text.insert(END, formatted, "info")
+        
+        self.log_text.see(END)
+        self.root.update()
+    
+    def _clear_log(self):
+        self.log_text.delete(1.0, END)
+    
+    def _copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get(1.0, END))
+        self._log("📋 Gekopieerd", "info")
+    
+    def _add_source(self):
+        folder = filedialog.askdirectory(title="Selecteer bronmap om te sorteren")
+        if folder:
+            self.source_listbox.insert(END, folder)
+            self._log(f"➕ Bronmap toegevoegd: {folder}", "info")
+    
+    def _add_home(self):
+        home = str(Path.home())
+        self.source_listbox.insert(END, home)
+        self._log(f"🏠 Home map toegevoegd: {home}", "info")
+    
+    def _remove_source(self):
+        selected = self.source_listbox.curselection()
+        if selected:
+            for i in reversed(selected):
+                folder = self.source_listbox.get(i)
+                self.source_listbox.delete(i)
+                self._log(f"❌ Bronmap verwijderd: {folder}", "warning")
+    
+    def _select_archive(self):
+        folder = filedialog.askdirectory(title="Selecteer archiefmap (doelmap voor gesorteerde bestanden)")
+        if folder:
+            self.archive_entry.delete(0, END)
+            self.archive_entry.insert(0, folder)
+            self._log(f"📁 Archiefmap: {folder}", "info")
+    
+    def _start_archive(self):
+        # Controleer of verwijderen is aangevinkt - extra veiligheidswaarschuwing
+        if self.delete_orig_var.get():
+            confirm = messagebox.askyesno(
+                "⚠️ WAARSCHUWING - Bestanden verwijderen",
+                "Je hebt aangevinkt dat originele bestanden VERWIJDERD mogen worden.\n\n"
+                "Dit kan niet ongedaan worden gemaakt!\n\n"
+                "Weet je zeker dat je de originele bestanden wilt verwijderen?\n"
+                "(Klik NEE om veilig te kopiëren zonder verwijdering)",
+                icon='warning'
+            )
+            if not confirm:
+                self.delete_orig_var.set(False)
+                self._log("🔒 Verwijderen uitgeschakeld (veilige modus)", "safety")
+                messagebox.showinfo("🔒 Veilige modus", 
+                                   "Originele bestanden worden NIET verwijderd.\n"
+                                   "Ze worden alleen gekopieerd naar de archiefmap.")
+                return
+        
+        if not self._validate():
+            return
+        
+        self._update_settings()
+        self.archiver = Archiver(self.settings)
+        self.running = True
+        
+        self.start_btn.config(state=DISABLED)
+        self.stop_btn.config(state=NORMAL)
+        
+        if self.settings.delete_original:
+            self.status_label.config(text="⚠️ VERWIJDEREN INGESCHAKELD - Wees voorzichtig!", foreground="red")
+            self.safety_indicator.config(text="⚠️ Verwijderen AAN", foreground="red")
+        else:
+            self.status_label.config(text="🟢 Bezig met kopiëren (veilig)...", foreground="green")
+            self.safety_indicator.config(text="🔒 Veilig - Kopiëren (geen verwijdering)", foreground="green")
+        
+        self.status_display.config(text="📊 Bezig met sorteren...")
+        self._log("🚀 Sorteren gestart!", "success")
+        self._log(f"🔒 Verwijderen: {'AAN' if self.settings.delete_original else 'UIT (veilig)'}", "safety")
+        
+        thread = threading.Thread(target=self._archive_thread, daemon=True)
+        thread.start()
+    
+    def _archive_thread(self):
+        try:
+            self.archiver.archive_all(self._log)
+            self.root.after(0, self._archive_complete)
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"❌ Fout: {e}", "error"))
+            self.root.after(0, self._archive_complete)
+    
+    def _archive_complete(self):
+        self.running = False
+        self.start_btn.config(state=NORMAL)
+        self.stop_btn.config(state=DISABLED)
+        
+        if self.settings.delete_original:
+            self.status_label.config(text="✅ Voltooid - Bestanden VERWIJDERD", foreground="red")
+        else:
+            self.status_label.config(text="✅ Voltooid - Bestanden gekopieerd (veilig)", foreground="green")
+            self.safety_indicator.config(text="🔒 Veilig - Kopiëren (geen verwijdering)", foreground="green")
+        
+        self.status_display.config(text="✅ Voltooid")
+        self._update_status()
+    
+    def _stop_archive(self):
+        self.running = False
+        self.start_btn.config(state=NORMAL)
+        self.stop_btn.config(state=DISABLED)
+        self.status_label.config(text="🔴 Gestopt", foreground="red")
+        self.status_display.config(text="🔴 Gestopt")
+        self._log("🛑 Gestopt", "warning")
+    
+    def _update_status(self):
+        if self.archiver:
+            stats = self.archiver.stats
+            self.status_display.config(text=f"📊 Gescand: {stats['total_scanned']} | Gearchiveerd: {stats['archived']}")
+    
+    def _validate(self) -> bool:
+        sources = list(self.source_listbox.get(0, END))
+        if not sources:
+            messagebox.showwarning("Waarschuwing", "Voeg minstens één bronmap toe")
+            return False
+        
+        archive = self.archive_entry.get().strip()
+        if not archive:
+            messagebox.showwarning("Waarschuwing", "Selecteer een archiefmap")
+            return False
+        
+        if not Path(archive).exists():
+            try:
+                Path(archive).mkdir(parents=True, exist_ok=True)
+                self._log(f"📁 Archiefmap aangemaakt: {archive}", "info")
+            except:
+                messagebox.showerror("Fout", f"Kan map niet aanmaken: {archive}")
+                return False
+        
+        return True
+    
+    def _update_settings(self):
+        self.settings.source_folders = list(self.source_listbox.get(0, END))
+        self.settings.archive_folder = self.archive_entry.get().strip()
+        self.settings.organize_by_category = self.category_var.get()
+        self.settings.organize_by_date = self.date_var.get()
+        self.settings.organize_by_type = self.type_var.get()
+        self.settings.include_hidden = self.hidden_var.get()
+        self.settings.detect_duplicates = self.duplicates_var.get()
+        self.settings.delete_original = self.delete_orig_var.get()  # Alleen als expliciet aangevinkt
+        self.settings.max_workers = multiprocessing.cpu_count()
+    
+    def _show_stats(self):
+        if self.archiver:
+            stats = self.archiver.stats
+            msg = f"""📊 SORTERING STATISTIEKEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Platform:     {platform.system()}
+  Gescand:      {stats['total_scanned']}
+  Gearchiveerd: {stats['archived']}
+  Duplicaten:   {stats['duplicates']}
+  Fouten:       {stats['errors']}
+  
+  Totaal:       {stats['total_size_mb'] / 1024:.2f} GB
+  Gearchiveerd: {stats['archived_size_mb'] / 1024:.2f} GB
+  
+  🔒 Verwijderd: {'JA' if self.settings.delete_original else 'NEE (veilig)'}
+  
+  ⏱️ Tijd: {stats['elapsed_seconds']:.0f} seconden"""
+            
+            if stats['categories']:
+                msg += "\n\n📂 CATEGORIEËN (gesorteerd):"
+                for cat, count in sorted(stats['categories'].items(), key=lambda x: x[1], reverse=True)[:10]:
+                    msg += f"\n  {cat}: {count} bestanden"
+            
+            messagebox.showinfo("Sorteer Statistieken", msg)
+        else:
+            messagebox.showinfo("Statistieken", "Nog geen sortering uitgevoerd")
+    
+    def _save_settings(self):
+        settings = {
+            'source_folders': list(self.source_listbox.get(0, END)),
+            'archive_folder': self.archive_entry.get().strip(),
+            'organize_by_category': self.category_var.get(),
+            'organize_by_date': self.date_var.get(),
+            'organize_by_type': self.type_var.get(),
+            'include_hidden': self.hidden_var.get(),
+            'detect_duplicates': self.duplicates_var.get(),
+            'delete_original': self.delete_orig_var.get()
+        }
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            self._log("💾 Instellingen opgeslagen", "success")
+        except Exception as e:
+            self._log(f"❌ Opslaan mislukt: {e}", "error")
+    
+    def _load_settings(self):
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r') as f:
+                    s = json.load(f)
+                
+                for folder in s.get('source_folders', []):
+                    self.source_listbox.insert(END, folder)
+                self.archive_entry.insert(0, s.get('archive_folder', ''))
+                self.category_var.set(s.get('organize_by_category', True))
+                self.date_var.set(s.get('organize_by_date', True))
+                self.type_var.set(s.get('organize_by_type', False))
+                self.hidden_var.set(s.get('include_hidden', False))
+                self.duplicates_var.set(s.get('detect_duplicates', True))
+                self.delete_orig_var.set(s.get('delete_original', False))
+                self._log("📂 Instellingen geladen", "info")
+        except Exception as e:
+            self._log(f"⚠️ Laden mislukt: {e}", "warning")
+
+
+# ============================================================================
+# START
+# ============================================================================
+
+def main():
+    root = Tk()
+    app = ArchiverApp(root)
+    
+    def on_closing():
+        if app.running:
+            app._stop_archive()
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
