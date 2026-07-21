@@ -1,0 +1,1064 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║           AI ARCHIVER + DUPLICATE FINDER - All-in-One v7.0                    ║
+║              ★ ONLY MAPS & DRIVES - Geen bestandselectie ★                   ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import shutil
+import re
+import json
+import hashlib
+import threading
+import queue
+import time
+import stat
+import sys
+from pathlib import Path
+from datetime import datetime
+from tkinter import *
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Set
+from enum import Enum
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Probeer AI (optioneel)
+try:
+    from transformers import pipeline
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+
+
+# ============================================================================
+# DOCUMENTTYPES & MAPPENSTRUCTUUR
+# ============================================================================
+
+class DocumentType(Enum):
+    OFFERTE = "offerte"
+    FACTUUR = "factuur"
+    CREDITNOTA = "creditnota"
+    VERKOOPSVOORWAARDEN = "verkoopsvoorwaarden"
+    WARMTEPOMP_ONDERHOUD = "warmtepomp_onderhoud"
+    WARMTEPOMP_LEKTEST = "warmtepomp_lektest"
+    WARMTEPOMP_INSTALLATIE = "warmtepomp_installatie"
+    HYDRAULISCH_GROOTONDERHOUD = "hydraulisch_grootonderhoud"
+    HYDRAULISCH_REGELING = "hydraulisch_regeling"
+    REINIGINGSATTEST_GAS = "reinigingsattest_gas"
+    REINIGINGSATTEST_VLOEIBARE = "reinigingsattest_vloeibare"
+    VERBRANDINGSATTEST = "verbrandingsattest"
+    ONDERHOUDSCONTRACT = "onderhoudscontract"
+    KLANTENLISTING = "klantenlisting"
+    TECHNISCHE_FICHE = "technische_fiche"
+    GARANTIEBEWIJS = "garantiebewijs"
+    LEVERINGSBON = "leveringsbon"
+    STOOKOLIE_BESTELLING = "stookolie_bestelling"
+    AFKEURINGSRAPPORT = "afkeuringsrapport"
+    KEURINGSRAPPORT = "keuringsrapport"
+
+    def get_map_naam(self) -> str:
+        mapping = {
+            DocumentType.OFFERTE: "Offertes",
+            DocumentType.FACTUUR: "Facturen",
+            DocumentType.CREDITNOTA: "Creditnotas",
+            DocumentType.VERKOOPSVOORWAARDEN: "Algemeen/Verkoopsvoorwaarden",
+            DocumentType.WARMTEPOMP_ONDERHOUD: "Warmtepompen/Onderhoud",
+            DocumentType.WARMTEPOMP_LEKTEST: "Warmtepompen/Lektesten",
+            DocumentType.WARMTEPOMP_INSTALLATIE: "Warmtepompen/Installaties",
+            DocumentType.HYDRAULISCH_GROOTONDERHOUD: "Hydraulica/Groot onderhoud",
+            DocumentType.HYDRAULISCH_REGELING: "Hydraulica/Regelingen",
+            DocumentType.REINIGINGSATTEST_GAS: "Attesten/Reiniging gasvormig",
+            DocumentType.REINIGINGSATTEST_VLOEIBARE: "Attesten/Reiniging vloeibare brandstof",
+            DocumentType.VERBRANDINGSATTEST: "Attesten/Verbranding",
+            DocumentType.ONDERHOUDSCONTRACT: "Contracten/Onderhoud",
+            DocumentType.KLANTENLISTING: "Klanten/Overzichten",
+            DocumentType.TECHNISCHE_FICHE: "Technische fiches",
+            DocumentType.GARANTIEBEWIJS: "Garanties",
+            DocumentType.LEVERINGSBON: "Leveringsbonnen",
+            DocumentType.STOOKOLIE_BESTELLING: "Stookolie/Bestellingen",
+            DocumentType.AFKEURINGSRAPPORT: "Rapporten/Afkeuringen",
+            DocumentType.KEURINGSRAPPORT: "Rapporten/Keuringen",
+        }
+        return mapping.get(self, "Overig")
+
+
+@dataclass
+class DocumentInfo:
+    bestandspad: Path
+    document_type: DocumentType
+    klant_naam: Optional[str] = None
+    volgnummer: Optional[str] = None
+    datum: Optional[datetime] = None
+    confidence: float = 0.0
+
+
+@dataclass
+class ScanResult:
+    pad: Path
+    niveau: int
+    bestanden: List[Path]
+    mappen: List[Path]
+    geselecteerd: bool = False
+
+
+# ============================================================================
+# SCHIJF DETECTOR
+# ============================================================================
+
+class DriveDetector:
+    """Detecteert alle beschikbare schijven op het systeem"""
+    
+    @staticmethod
+    def get_all_drives() -> List[Dict]:
+        """Geeft een lijst van alle beschikbare schijven"""
+        drives = []
+        
+        if sys.platform == "win32":
+            # Windows: alle schijven van A: tot Z:
+            import string
+            from ctypes import windll
+            
+            for letter in string.ascii_uppercase:
+                drive_path = f"{letter}:\\"
+                if os.path.exists(drive_path):
+                    try:
+                        # Bepaal schijftype
+                        drive_type = windll.kernel32.GetDriveTypeW(drive_path)
+                        type_names = {
+                            0: "Onbekend",
+                            1: "Bestaat niet",
+                            2: "Verwisselbaar",
+                            3: "Vaste schijf",
+                            4: "Netwerk",
+                            5: "CD-ROM",
+                            6: "RAM-schijf"
+                        }
+                        
+                        # Bereken vrije ruimte
+                        try:
+                            usage = shutil.disk_usage(drive_path)
+                            free_gb = usage.free / (1024**3)
+                            total_gb = usage.total / (1024**3)
+                            space_info = f"{free_gb:.1f} GB vrij / {total_gb:.1f} GB totaal"
+                        except:
+                            space_info = "Onbekende ruimte"
+                        
+                        drives.append({
+                            'path': drive_path,
+                            'letter': letter,
+                            'type': type_names.get(drive_type, "Onbekend"),
+                            'space': space_info,
+                            'is_drive': True
+                        })
+                    except:
+                        pass
+        else:
+            # Linux/Mac: /mnt, /media, etc.
+            for path in ['/mnt', '/media', '/']:
+                if os.path.exists(path):
+                    for item in os.listdir(path):
+                        full_path = os.path.join(path, item)
+                        if os.path.ismount(full_path):
+                            try:
+                                usage = shutil.disk_usage(full_path)
+                                free_gb = usage.free / (1024**3)
+                                total_gb = usage.total / (1024**3)
+                                drives.append({
+                                    'path': full_path,
+                                    'letter': item,
+                                    'type': "Mount point",
+                                    'space': f"{free_gb:.1f} GB vrij / {total_gb:.1f} GB totaal",
+                                    'is_drive': True
+                                })
+                            except:
+                                pass
+        
+        return drives
+
+
+# ============================================================================
+# SORTEERMOTOR
+# ============================================================================
+
+class HVACSorteerder:
+    def __init__(self, target_base: Path):
+        self.target_base = Path(target_base)
+        self.classifier = None
+        self.volgnummers_file = self.target_base / "volgnummers.json"
+        self.volgnummers = self._laad_volgnummers()
+        self.trefwoorden = {
+            "offerte": DocumentType.OFFERTE, "off": DocumentType.OFFERTE,
+            "factuur": DocumentType.FACTUUR, "fact": DocumentType.FACTUUR,
+            "creditnota": DocumentType.CREDITNOTA, "credit": DocumentType.CREDITNOTA,
+            "verkoopsvoorwaarde": DocumentType.VERKOOPSVOORWAARDEN, "terms": DocumentType.VERKOOPSVOORWAARDEN,
+            "warmtepomp": DocumentType.WARMTEPOMP_ONDERHOUD,
+            "lektest": DocumentType.WARMTEPOMP_LEKTEST,
+            "installatie": DocumentType.WARMTEPOMP_INSTALLATIE,
+            "hydraulisch": DocumentType.HYDRAULISCH_GROOTONDERHOUD,
+            "regeling": DocumentType.HYDRAULISCH_REGELING,
+            "reinigingsattest": DocumentType.REINIGINGSATTEST_GAS,
+            "verbrandingsattest": DocumentType.VERBRANDINGSATTEST,
+            "onderhoudscontract": DocumentType.ONDERHOUDSCONTRACT,
+            "garantie": DocumentType.GARANTIEBEWIJS,
+            "leveringsbon": DocumentType.LEVERINGSBON,
+            "stookolie": DocumentType.STOOKOLIE_BESTELLING,
+        }
+
+    def _laad_volgnummers(self) -> Dict:
+        if self.volgnummers_file.exists():
+            with open(self.volgnummers_file, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def _bewaar_volgnummers(self):
+        self.volgnummers_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.volgnummers_file, 'w') as f:
+            json.dump(self.volgnummers, f, indent=2)
+
+    def genereer_volgnummer(self, doc_type: DocumentType, jaar: int = None) -> str:
+        if jaar is None:
+            jaar = datetime.now().year
+        key = f"{doc_type.value}_{jaar}"
+        self.volgnummers[key] = self.volgnummers.get(key, 0) + 1
+        self._bewaar_volgnummers()
+        prefix = {DocumentType.OFFERTE: "OFF", DocumentType.FACTUUR: "FACT", DocumentType.CREDITNOTA: "CRED"}.get(doc_type, doc_type.value[:4].upper())
+        return f"{prefix}-{jaar}-{self.volgnummers[key]:03d}"
+
+    def herken_documenttype_op_naam(self, bestandsnaam: str) -> Optional[DocumentType]:
+        naam_lower = bestandsnaam.lower()
+        for trefwoord, doc_type in self.trefwoorden.items():
+            if trefwoord in naam_lower:
+                return doc_type
+        return None
+
+    def herken_documenttype_met_ai(self, bestandsnaam: str) -> Tuple[Optional[DocumentType], float]:
+        if not self.classifier or not AI_AVAILABLE:
+            return None, 0.0
+        try:
+            result = self.classifier(bestandsnaam, [dt.value for dt in DocumentType])
+            beste_label = result['labels'][0]
+            score = result['scores'][0]
+            for dt in DocumentType:
+                if dt.value == beste_label:
+                    return dt, score
+        except Exception:
+            pass
+        return None, 0.0
+
+    def _extraheer_klantnaam(self, bestandsnaam: str) -> Optional[str]:
+        patronen = [
+            r'klant[_\s]*([A-Z][a-z]+(?:_[A-Z][a-z]+)?)',
+            r'voor\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+            r'(\w+)_(?:offerte|factuur|onderhoud)',
+            r'(\w+)_\d{4}',
+        ]
+        for patroon in patronen:
+            match = re.search(patroon, bestandsnaam, re.IGNORECASE)
+            if match:
+                return match.group(1).replace('_', ' ')
+        return None
+
+    def bepaal_doelpad(self, doc_info: DocumentInfo) -> Path:
+        base = self.target_base / doc_info.document_type.get_map_naam()
+        if doc_info.klant_naam:
+            klant_clean = re.sub(r'[<>:"/\\|?*]', '_', doc_info.klant_naam.strip())
+            base = base / klant_clean
+        jaar = doc_info.datum.year if doc_info.datum else datetime.now().year
+        base = base / str(jaar)
+        if doc_info.volgnummer:
+            nieuwe_naam = f"{doc_info.volgnummer}_{doc_info.bestandspad.name}"
+        else:
+            nieuwe_naam = doc_info.bestandspad.name
+        return base / nieuwe_naam
+
+    def sorteer_bestand(self, bestandspad: Path, log_callback=None) -> bool:
+        try:
+            if not bestandspad.is_file():
+                return False
+            doc_type = self.herken_documenttype_op_naam(bestandspad.name)
+            confidence = 0.0
+            if not doc_type and self.classifier:
+                doc_type, confidence = self.herken_documenttype_met_ai(bestandspad.name)
+            if not doc_type:
+                if log_callback:
+                    log_callback(f"⚠️ Onbekend type: {bestandspad.name}")
+                return False
+            volgnummer = None
+            if doc_type in [DocumentType.OFFERTE, DocumentType.FACTUUR, DocumentType.CREDITNOTA]:
+                volgnummer = self.genereer_volgnummer(doc_type)
+            doc_info = DocumentInfo(
+                bestandspad=bestandspad,
+                document_type=doc_type,
+                klant_naam=self._extraheer_klantnaam(bestandspad.name),
+                volgnummer=volgnummer,
+                datum=datetime.now(),
+                confidence=confidence
+            )
+            doelpad = self.bepaal_doelpad(doc_info)
+            doelpad.parent.mkdir(parents=True, exist_ok=True)
+            if doelpad.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                doelpad = doelpad.parent / f"{doelpad.stem}_{timestamp}{doelpad.suffix}"
+            shutil.move(str(bestandspad), str(doelpad))
+            if log_callback:
+                conf_str = f" (AI: {confidence:.0%})" if confidence > 0 else ""
+                volg_str = f" [{volgnummer}]" if volgnummer else ""
+                log_callback(f"✅ {bestandspad.name}{volg_str} → {doc_info.document_type.get_map_naam()}{conf_str}")
+            return True
+        except Exception as e:
+            if log_callback:
+                log_callback(f"❌ Fout: {bestandspad.name} - {str(e)}")
+            return False
+
+    def laad_ai_model(self, model_naam: str = "facebook/bart-large-mnli") -> bool:
+        if not AI_AVAILABLE:
+            return False
+        try:
+            self.classifier = pipeline("zero-shot-classification", model=model_naam)
+            return True
+        except Exception:
+            return False
+
+
+# ============================================================================
+# SUBMAP SCANNER MET WERKENDE SELECTIE
+# ============================================================================
+
+class SubmapScanner:
+    def __init__(self, max_diepte: int = 4):
+        self.max_diepte = max_diepte
+        self.scan_results: List[ScanResult] = []
+    
+    def scan_map(self, pad: Path, huidige_diepte: int = 0) -> List[ScanResult]:
+        results = []
+        if huidige_diepte > self.max_diepte:
+            return results
+        try:
+            if not pad.exists() or not pad.is_dir():
+                return results
+            bestanden = [f for f in pad.iterdir() if f.is_file()]
+            mappen = [d for d in pad.iterdir() if d.is_dir()]
+            result = ScanResult(pad=pad, niveau=huidige_diepte, bestanden=bestanden, mappen=mappen, geselecteerd=False)
+            results.append(result)
+            for submap in mappen:
+                results.extend(self.scan_map(submap, huidige_diepte + 1))
+        except PermissionError:
+            pass
+        return results
+    
+    def get_mappenboom(self, results: List[ScanResult]) -> str:
+        if not results:
+            return "Geen mappen gevonden"
+        output = []
+        for r in results:
+            indent = "  " * r.niveau
+            status = "☐" if not r.geselecteerd else "☑"
+            output.append(f"{indent}{status} 📁 {r.pad.name if r.niveau > 0 else r.pad} ({len(r.bestanden)} bestanden)")
+        return "\n".join(output)
+    
+    def vraag_toestemming_gui(self, parent, results: List[ScanResult]) -> List[ScanResult]:
+        if not results:
+            return []
+        
+        dialog = Toplevel(parent)
+        dialog.title("🗂️ Selecteer mappen om te archiveren")
+        dialog.geometry("1000x750")
+        dialog.transient(parent)
+        dialog.grab_set()
+        
+        # Instructie
+        instr_frame = Frame(dialog, bg='#1a1a2e', pady=10)
+        instr_frame.pack(fill=X)
+        Label(instr_frame, text="Selecteer de mappen die je wilt archiveren (vinkjes aanvinken):", 
+              font=('Arial', 12, 'bold'), bg='#1a1a2e', fg='#e94560').pack()
+        
+        # Hoofdframe met scrollbar
+        main_frame = Frame(dialog, bg='#1a1a2e')
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        canvas = Canvas(main_frame, bg='#1a1a2e', highlightthickness=0)
+        scrollbar = Scrollbar(main_frame, orient=VERTICAL, command=canvas.yview)
+        scrollable_frame = Frame(canvas, bg='#1a1a2e')
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor=NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        
+        # Checkbox variabelen
+        check_vars = []
+        
+        for r in results:
+            indent = "  " * r.niveau
+            var = BooleanVar(value=r.geselecteerd)
+            check_vars.append((r, var))
+            
+            frame = Frame(scrollable_frame, bg='#1a1a2e')
+            frame.pack(anchor=W, pady=2)
+            
+            Label(frame, text=indent, bg='#1a1a2e', fg='white', width=len(indent), anchor=W).pack(side=LEFT)
+            cb = Checkbutton(frame, variable=var, bg='#1a1a2e', fg='white', activebackground='#1a1a2e', selectcolor='#1a1a2e')
+            cb.pack(side=LEFT)
+            
+            map_naam = r.pad.name if r.niveau > 0 else str(r.pad)
+            Label(frame, text=f"📁 {map_naam} ({len(r.bestanden)} bestanden, {len(r.mappen)} submappen)", 
+                  bg='#1a1a2e', fg='#e94560', font=('Arial', 10), anchor=W).pack(side=LEFT, padx=5)
+        
+        # Knoppen onderaan
+        btn_frame = Frame(dialog, bg='#1a1a2e', pady=15)
+        btn_frame.pack(fill=X)
+        
+        def select_all():
+            for _, var in check_vars:
+                var.set(True)
+        
+        def select_none():
+            for _, var in check_vars:
+                var.set(False)
+        
+        def select_with_files():
+            for r, var in check_vars:
+                var.set(len(r.bestanden) > 0)
+        
+        def confirm():
+            for r, var in check_vars:
+                r.geselecteerd = var.get()
+            dialog.destroy()
+        
+        Button(btn_frame, text="✅ Alles selecteren", command=select_all,
+               bg='#27ae60', fg='white', padx=15, pady=5, cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=10)
+        Button(btn_frame, text="❌ Niets selecteren", command=select_none,
+               bg='#e74c3c', fg='white', padx=15, pady=5, cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=10)
+        Button(btn_frame, text="📄 Alleen mappen met bestanden", command=select_with_files,
+               bg='#3498db', fg='white', padx=15, pady=5, cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=10)
+        Button(btn_frame, text="🚀 Archiveren", command=confirm,
+               bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=5, cursor='hand2').pack(side=RIGHT, padx=10)
+        
+        dialog.wait_window()
+        
+        return [r for r, var in check_vars if var.get()]
+
+
+# ============================================================================
+# DUPLICATE FINDER
+# ============================================================================
+
+class DuplicateFinder:
+    def __init__(self):
+        self.duplicates = {}
+        self.scanning = False
+        self.stop_scan = False
+    
+    def fast_hash(self, file_path, block_size=65536):
+        hasher = hashlib.md5()
+        try:
+            with open(file_path, 'rb') as f:
+                size = os.path.getsize(file_path)
+                if size > 10 * 1024 * 1024:
+                    f.seek(0)
+                    hasher.update(f.read(block_size))
+                    mid_pos = size // 2
+                    f.seek(mid_pos)
+                    hasher.update(f.read(block_size))
+                    f.seek(max(0, size - block_size))
+                    hasher.update(f.read(block_size))
+                else:
+                    for block in iter(lambda: f.read(block_size), b''):
+                        hasher.update(block)
+            return hasher.hexdigest()
+        except:
+            return None
+    
+    def scan_duplicates(self, bron_pad: Path, log_callback=None, progress_callback=None) -> Dict:
+        size_dict = defaultdict(list)
+        file_count = 0
+        stack = [bron_pad]
+        processed_dirs = set()
+        
+        while stack and not self.stop_scan:
+            current_dir = stack.pop()
+            if current_dir in processed_dirs:
+                continue
+            processed_dirs.add(current_dir)
+            try:
+                with os.scandir(current_dir) as entries:
+                    for entry in entries:
+                        if self.stop_scan:
+                            return {}
+                        try:
+                            if entry.is_file():
+                                size = entry.stat().st_size
+                                size_dict[size].append(entry.path)
+                                file_count += 1
+                                if progress_callback and file_count % 100 == 0:
+                                    progress_callback(file_count)
+                            elif entry.is_dir():
+                                stack.append(entry.path)
+                        except:
+                            pass
+            except:
+                pass
+        
+        if self.stop_scan:
+            return {}
+        
+        duplicates = {}
+        for size, files in size_dict.items():
+            if len(files) > 1 and not self.stop_scan:
+                hash_dict = defaultdict(list)
+                for f in files:
+                    h = self.fast_hash(f)
+                    if h:
+                        hash_dict[h].append(f)
+                for h, paths in hash_dict.items():
+                    if len(paths) > 1:
+                        duplicates[h] = paths
+        
+        return duplicates
+
+
+# ============================================================================
+# MAIN APPLICATIE
+# ============================================================================
+
+class AIArchiverApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🤖 AI ARCHIVER + DUPLICATE FINDER - Alleen Mappen & Schijven")
+        self.root.geometry("1500x950")
+        self.root.configure(bg='#1a1a2e')
+        
+        # Kleuren
+        self.bg = '#1a1a2e'
+        self.fg = '#eee'
+        self.accent = '#0f3460'
+        self.highlight = '#e94560'
+        
+        # Variabelen
+        self.watch_folder = StringVar()
+        self.target_base = StringVar()
+        self.scan_folder = StringVar()
+        self.duplicate_source = StringVar()
+        self.duplicate_dest = StringVar()
+        self.ai_model = StringVar(value="facebook/bart-large-mnli")
+        self.max_depth = IntVar(value=4)
+        self.selected_drive = StringVar()
+        
+        self.running = False
+        self.sorteerder = None
+        self.scanner = SubmapScanner()
+        self.scan_results = []
+        self.duplicate_finder = DuplicateFinder()
+        self.duplicates = {}
+        self.drives = []
+        
+        self._setup_ui()
+        self._load_settings()
+        self._detect_drives()
+        
+        if not AI_AVAILABLE:
+            self._log("⚠️ AI niet beschikbaar. Alleen trefwoordherkenning.")
+    
+    def _detect_drives(self):
+        """Detecteer alle beschikbare schijven"""
+        self.drives = DriveDetector.get_all_drives()
+        self._log(f"💾 {len(self.drives)} schijven gedetecteerd")
+        
+        # Update de drive combobox
+        if hasattr(self, 'drive_combo'):
+            drive_list = [f"{d['letter']}:\\ ({d['type']})" for d in self.drives]
+            self.drive_combo['values'] = drive_list
+    
+    def _setup_ui(self):
+        # Notebook voor tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # Tab 1: AI Archiver
+        self.archive_frame = Frame(self.notebook, bg=self.bg)
+        self.notebook.add(self.archive_frame, text="🤖 AI ARCHIVER - Alleen Mappen")
+        self._setup_archive_tab()
+        
+        # Tab 2: Duplicate Finder
+        self.duplicate_frame = Frame(self.notebook, bg=self.bg)
+        self.notebook.add(self.duplicate_frame, text="🔍 DUPLICATE FINDER - Alleen Mappen")
+        self._setup_duplicate_tab()
+        
+        # Tab 3: Logboek
+        self.log_frame = Frame(self.notebook, bg=self.bg)
+        self.notebook.add(self.log_frame, text="📋 LOGBOEK")
+        self._setup_log_tab()
+    
+    def _setup_archive_tab(self):
+        main = Frame(self.archive_frame, bg=self.bg)
+        main.pack(fill=BOTH, expand=True, padx=15, pady=15)
+        
+        # Titel
+        Label(main, text="📁 AI GESTUURD ARCHIVEREN - Alleen Mappen & Schijven", 
+              font=('Arial', 16, 'bold'), bg=self.bg, fg=self.highlight).pack(pady=10)
+        
+        # Configuratie
+        cfg = LabelFrame(main, text="Configuratie", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        cfg.pack(fill=X, pady=10)
+        
+        f1 = Frame(cfg, bg=self.bg)
+        f1.pack(fill=X, padx=10, pady=5)
+        Label(f1, text="Doelmap (archief):", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        Entry(f1, textvariable=self.target_base, width=60, bg='#16213e', fg=self.fg, insertbackground='white', font=('Arial', 10)).pack(side=LEFT, padx=5)
+        Button(f1, text="📁 Bladeren", command=self._select_target_folder, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT)
+        
+        f2 = Frame(cfg, bg=self.bg)
+        f2.pack(fill=X, padx=10, pady=5)
+        Label(f2, text="AI Model:", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        ttk.Combobox(f2, textvariable=self.ai_model, values=('facebook/bart-large-mnli', 'typeform/distilbert-base-uncased-mnli'), width=55).pack(side=LEFT, padx=5)
+        Button(f2, text="🔄 Laad AI", command=self._reload_ai, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT)
+        
+        # Schijfselectie sectie
+        drive_frame = LabelFrame(main, text="💾 Snelle Schijfselectie", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        drive_frame.pack(fill=X, pady=10)
+        
+        f3 = Frame(drive_frame, bg=self.bg)
+        f3.pack(fill=X, padx=10, pady=5)
+        Label(f3, text="Selecteer schijf:", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        self.drive_combo = ttk.Combobox(f3, textvariable=self.selected_drive, width=55)
+        self.drive_combo.pack(side=LEFT, padx=5)
+        Button(f3, text="💾 Gebruik deze schijf", command=self._use_selected_drive, bg='#27ae60', fg='white', cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=5)
+        
+        # Submap scanner sectie
+        scanner_frame = LabelFrame(main, text="🗂️ Map Scanner (Alleen mappen - geen bestanden)", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        scanner_frame.pack(fill=X, pady=10)
+        
+        f4 = Frame(scanner_frame, bg=self.bg)
+        f4.pack(fill=X, padx=10, pady=5)
+        Label(f4, text="Te scannen map:", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        Entry(f4, textvariable=self.scan_folder, width=60, bg='#16213e', fg=self.fg, font=('Arial', 10)).pack(side=LEFT, padx=5)
+        Button(f4, text="📁 Bladeren (alleen mappen)", command=self._select_scan_folder, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT)
+        
+        f5 = Frame(scanner_frame, bg=self.bg)
+        f5.pack(fill=X, padx=10, pady=5)
+        Label(f5, text="Max diepte (1-4):", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        Spinbox(f5, from_=1, to=4, textvariable=self.max_depth, width=10, bg='#16213e', fg=self.fg, font=('Arial', 10)).pack(side=LEFT)
+        
+        btn_frame = Frame(scanner_frame, bg=self.bg)
+        btn_frame.pack(pady=10)
+        Button(btn_frame, text="🔍 SCAN SUBMAPPEN", command=self._start_scan, 
+               bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, cursor='hand2').pack(side=LEFT, padx=10)
+        Button(btn_frame, text="🚀 ARCHIVEER GESELECTEERD", command=self._archive_selected, 
+               bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, cursor='hand2').pack(side=LEFT, padx=10)
+        
+        # Resultaten lijst
+        result_frame = LabelFrame(main, text="Geselecteerde mappen voor archivering", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        result_frame.pack(fill=BOTH, expand=True, pady=10)
+        
+        self.scan_listbox = Listbox(result_frame, bg='#16213e', fg=self.fg, selectbackground=self.highlight, height=8, font=('Consolas', 10))
+        self.scan_listbox.pack(fill=BOTH, expand=True, padx=5, pady=5)
+    
+    def _setup_duplicate_tab(self):
+        main = Frame(self.duplicate_frame, bg=self.bg)
+        main.pack(fill=BOTH, expand=True, padx=15, pady=15)
+        
+        Label(main, text="🔍 DUPLICATE BESTANDEN FINDER - Alleen Mappen & Schijven", 
+              font=('Arial', 16, 'bold'), bg=self.bg, fg=self.highlight).pack(pady=10)
+        
+        # Configuratie
+        cfg = LabelFrame(main, text="Configuratie", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        cfg.pack(fill=X, pady=10)
+        
+        f1 = Frame(cfg, bg=self.bg)
+        f1.pack(fill=X, padx=10, pady=5)
+        Label(f1, text="Bronmap/schijf:", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        Entry(f1, textvariable=self.duplicate_source, width=60, bg='#16213e', fg=self.fg, font=('Arial', 10)).pack(side=LEFT, padx=5)
+        Button(f1, text="📁 Bladeren (alleen mappen)", command=self._select_dup_source, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT)
+        
+        f2 = Frame(cfg, bg=self.bg)
+        f2.pack(fill=X, padx=10, pady=5)
+        Label(f2, text="Doelmap voor duplicaten:", bg=self.bg, fg=self.fg, width=18, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        Entry(f2, textvariable=self.duplicate_dest, width=60, bg='#16213e', fg=self.fg, font=('Arial', 10)).pack(side=LEFT, padx=5)
+        Button(f2, text="📁 Bladeren (alleen mappen)", command=self._select_dup_dest, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT)
+        
+        # Schijfselectie voor duplicates
+        drive_frame = LabelFrame(main, text="💾 Of selecteer een schijf om te scannen", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        drive_frame.pack(fill=X, pady=10)
+        
+        f3 = Frame(drive_frame, bg=self.bg)
+        f3.pack(fill=X, padx=10, pady=5)
+        Label(f3, text="Selecteer schijf voor scan:", bg=self.bg, fg=self.fg, width=22, anchor=W, font=('Arial', 10)).pack(side=LEFT)
+        self.dup_drive_combo = ttk.Combobox(f3, width=55)
+        self.dup_drive_combo.pack(side=LEFT, padx=5)
+        Button(f3, text="💾 Scan deze schijf", command=self._use_selected_dup_drive, bg='#27ae60', fg='white', cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=5)
+        
+        # Status
+        self.dup_status = Label(main, text="✅ Klaar voor scan", bg=self.bg, fg=self.fg, font=('Arial', 10))
+        self.dup_status.pack(pady=5)
+        
+        self.dup_counter = Label(main, text="Bestanden gescand: 0", bg=self.bg, fg=self.highlight, font=('Arial', 11, 'bold'))
+        self.dup_counter.pack()
+        
+        # Progress bar
+        self.dup_progress = ttk.Progressbar(main, mode='indeterminate')
+        self.dup_progress.pack(fill=X, pady=5)
+        
+        # Knoppen
+        btn_frame = Frame(main, bg=self.bg)
+        btn_frame.pack(pady=10)
+        self.scan_dup_btn = Button(btn_frame, text="🔍 SCAN OP DUPLICATEN", command=self._start_dup_scan, 
+                                   bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, cursor='hand2')
+        self.scan_dup_btn.pack(side=LEFT, padx=10)
+        self.stop_dup_btn = Button(btn_frame, text="⏹ STOP SCAN", command=self._stop_dup_scan, 
+                                   bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, state=DISABLED, cursor='hand2')
+        self.stop_dup_btn.pack(side=LEFT, padx=10)
+        self.move_dup_btn = Button(btn_frame, text="📦 VERPLAATS DUPLICATEN", command=self._move_duplicates, 
+                                   bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, state=DISABLED, cursor='hand2')
+        self.move_dup_btn.pack(side=LEFT, padx=10)
+        self.del_dup_btn = Button(btn_frame, text="🗑️ VERWIJDER DUPLICATEN", command=self._delete_duplicates, 
+                                  bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), padx=25, pady=8, state=DISABLED, cursor='hand2')
+        self.del_dup_btn.pack(side=LEFT, padx=10)
+        
+        # Resultaten lijst
+        result_frame = LabelFrame(main, text="Gevonden duplicaten", bg=self.bg, fg=self.fg, font=('Arial', 11, 'bold'))
+        result_frame.pack(fill=BOTH, expand=True, pady=10)
+        
+        scroll_y = Scrollbar(result_frame)
+        scroll_y.pack(side=RIGHT, fill=Y)
+        
+        self.dup_listbox = Listbox(result_frame, bg='#16213e', fg=self.fg, selectbackground=self.highlight, font=('Consolas', 9), yscrollcommand=scroll_y.set)
+        self.dup_listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll_y.config(command=self.dup_listbox.yview)
+    
+    def _setup_log_tab(self):
+        main = Frame(self.log_frame, bg=self.bg)
+        main.pack(fill=BOTH, expand=True, padx=15, pady=15)
+        
+        Label(main, text="📋 ACTIVITEITEN LOG", font=('Arial', 16, 'bold'),
+              bg=self.bg, fg=self.highlight).pack(pady=10)
+        
+        log_controls = Frame(main, bg=self.bg)
+        log_controls.pack(fill=X, pady=5)
+        Button(log_controls, text="🗑 Wissen", command=self._clear_log, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=5)
+        Button(log_controls, text="📋 Kopieer", command=self._copy_log, bg=self.accent, fg=self.fg, cursor='hand2', font=('Arial', 10)).pack(side=LEFT, padx=5)
+        
+        self.log_text = scrolledtext.ScrolledText(main, bg='#16213e', fg=self.fg, font=('Consolas', 10))
+        self.log_text.pack(fill=BOTH, expand=True)
+    
+    def _log(self, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(END, f"[{timestamp}] {msg}\n")
+        self.log_text.see(END)
+        self.root.update_idletasks()
+    
+    def _clear_log(self):
+        self.log_text.delete(1.0, END)
+    
+    def _copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get(1.0, END))
+        self._log("📋 Logboek gekopieerd")
+    
+    def _select_target_folder(self):
+        folder = filedialog.askdirectory(title="Selecteer doelmap voor archief")
+        if folder:
+            self.target_base.set(folder)
+            self._log(f"📁 Doelmap geselecteerd: {folder}")
+    
+    def _select_scan_folder(self):
+        folder = filedialog.askdirectory(title="Selecteer map om te scannen (alleen mappen)")
+        if folder:
+            self.scan_folder.set(folder)
+            self._log(f"📁 Scanmap geselecteerd: {folder}")
+    
+    def _select_dup_source(self):
+        folder = filedialog.askdirectory(title="Selecteer bronmap voor duplicate scan (alleen mappen)")
+        if folder:
+            self.duplicate_source.set(folder)
+            self._log(f"📁 Duplicate bronmap: {folder}")
+    
+    def _select_dup_dest(self):
+        folder = filedialog.askdirectory(title="Selecteer doelmap voor duplicaten")
+        if folder:
+            self.duplicate_dest.set(folder)
+            self._log(f"📁 Duplicate doelmap: {folder}")
+    
+    def _use_selected_drive(self):
+        """Gebruik de geselecteerde schijf als scanbron"""
+        selection = self.drive_combo.get()
+        if selection:
+            drive_letter = selection.split(':')[0] + ':'
+            self.scan_folder.set(drive_letter + '\\')
+            self._log(f"💾 Schijf geselecteerd voor scanning: {drive_letter}")
+    
+    def _use_selected_dup_drive(self):
+        """Gebruik de geselecteerde schijf voor duplicate scan"""
+        selection = self.dup_drive_combo.get()
+        if selection:
+            drive_letter = selection.split(':')[0] + ':'
+            self.duplicate_source.set(drive_letter + '\\')
+            self._log(f"💾 Schijf geselecteerd voor duplicate scan: {drive_letter}")
+    
+    def _reload_ai(self):
+        if not self.target_base.get():
+            messagebox.showwarning("Waarschuwing", "Selecteer eerst een doelmap")
+            return
+        if not self.sorteerder:
+            self.sorteerder = HVACSorteerder(Path(self.target_base.get()))
+        self._log("🔄 AI model laden...")
+        ok = self.sorteerder.laad_ai_model(self.ai_model.get())
+        if ok:
+            self._log(f"✅ AI model geladen: {self.ai_model.get()}")
+        else:
+            self._log("❌ AI laden mislukt - valt terug op trefwoorden")
+    
+    def _start_scan(self):
+        if not self.scan_folder.get():
+            messagebox.showwarning("Waarschuwing", "Selecteer een map of schijf om te scannen")
+            return
+        scan_pad = Path(self.scan_folder.get())
+        if not scan_pad.exists():
+            messagebox.showerror("Fout", "Map/schijf bestaat niet")
+            return
+        
+        max_diepte = self.max_depth.get()
+        self.scanner = SubmapScanner(max_diepte=max_diepte)
+        self._log(f"🔍 Scannen: {scan_pad} (max diepte: {max_diepte} niveaus)")
+        self._log("📌 Alleen mappen worden gescand - geen bestanden worden geopend")
+        
+        self.root.config(cursor="watch")
+        self.root.update()
+        
+        try:
+            results = self.scanner.scan_map(scan_pad)
+            self._log(f"✅ {len(results)} mappen gevonden")
+            
+            geselecteerd = self.scanner.vraag_toestemming_gui(self.root, results)
+            self.scan_results = geselecteerd
+            
+            self.scan_listbox.delete(0, END)
+            for r in geselecteerd:
+                indent = "  " * r.niveau
+                self.scan_listbox.insert(END, f"{indent}📁 {r.pad.name if r.niveau > 0 else r.pad} ({len(r.bestanden)} bestanden, {len(r.mappen)} submappen)")
+            
+            self._log(f"✅ {len(geselecteerd)} mappen geselecteerd voor archivering")
+        except Exception as e:
+            self._log(f"❌ Fout bij scannen: {e}")
+            messagebox.showerror("Fout", f"Fout bij scannen: {e}")
+        finally:
+            self.root.config(cursor="")
+    
+    def _archive_selected(self):
+        if not self.scan_results:
+            messagebox.showwarning("Waarschuwing", "Geen mappen geselecteerd. Scan eerst en selecteer mappen.")
+            return
+        if not self.sorteerder:
+            if not self.target_base.get():
+                messagebox.showwarning("Waarschuwing", "Selecteer eerst een doelmap")
+                return
+            self.sorteerder = HVACSorteerder(Path(self.target_base.get()))
+        
+        totaal = sum(len(r.bestanden) for r in self.scan_results)
+        if totaal == 0:
+            self._log("📭 Geen bestanden gevonden in geselecteerde mappen")
+            messagebox.showinfo("Info", "Geen bestanden gevonden in geselecteerde mappen")
+            return
+        
+        antwoord = messagebox.askyesno("Bevestiging", f"Weet je zeker dat je {totaal} bestanden wilt archiveren?\n\nDe bestanden worden verplaatst naar de gestructureerde archiefmap!")
+        if not antwoord:
+            self._log("❌ Archivering geannuleerd")
+            return
+        
+        self._log(f"🚀 Archiveren van {totaal} bestanden...")
+        verwerkt = 0
+        for result in self.scan_results:
+            self._log(f"📁 Verwerken: {result.pad}")
+            for bestand in result.bestanden:
+                if self.sorteerder.sorteer_bestand(bestand, self._log):
+                    verwerkt += 1
+                self.root.update_idletasks()
+        
+        self._log(f"✨ Klaar! {verwerkt} bestanden verplaatst.")
+        messagebox.showinfo("Voltooid", f"{verwerkt} bestanden succesvol gearchiveerd!")
+    
+    def _start_dup_scan(self):
+        if not self.duplicate_source.get():
+            messagebox.showwarning("Waarschuwing", "Selecteer een bronmap of schijf")
+            return
+        
+        bron = self.duplicate_source.get()
+        self._log(f"🔍 Starten duplicate scan op: {bron}")
+        
+        self.duplicates = {}
+        self.dup_listbox.delete(0, END)
+        self.move_dup_btn.config(state=DISABLED)
+        self.del_dup_btn.config(state=DISABLED)
+        self.scan_dup_btn.config(state=DISABLED)
+        self.stop_dup_btn.config(state=NORMAL)
+        self.dup_progress.start()
+        
+        self.duplicate_finder.stop_scan = False
+        self.dup_status.config(text="🔍 Bezig met scannen...", fg='#f39c12')
+        
+        self.dup_finder_thread = threading.Thread(target=self._scan_duplicates_thread, daemon=True)
+        self.dup_finder_thread.start()
+    
+    def _scan_duplicates_thread(self):
+        self.duplicate_finder.scanning = True
+        
+        def progress_callback(count):
+            self.dup_counter.config(text=f"Bestanden gescand: {count:,}")
+            self.root.update_idletasks()
+        
+        self.duplicates = self.duplicate_finder.scan_duplicates(
+            Path(self.duplicate_source.get()),
+            log_callback=self._log,
+            progress_callback=progress_callback
+        )
+        
+        self.duplicate_finder.scanning = False
+        self.root.after(0, self._display_duplicates)
+    
+    def _stop_dup_scan(self):
+        self.duplicate_finder.stop_scan = True
+        self._log("⏹️ Duplicate scan gestopt door gebruiker")
+        self.dup_status.config(text="⏹️ Scan gestopt", fg='#e74c3c')
+    
+    def _display_duplicates(self):
+        self.dup_progress.stop()
+        self.scan_dup_btn.config(state=NORMAL)
+        self.stop_dup_btn.config(state=DISABLED)
+        
+        total = 0
+        for paths in self.duplicates.values():
+            total += len(paths) - 1
+            original = paths[0]
+            self.dup_listbox.insert(END, f"📁 {os.path.basename(original)} - {len(paths)}x")
+            for dup in paths[1:]:
+                self.dup_listbox.insert(END, f"  └─ {dup}")
+            self.dup_listbox.insert(END, "")
+        
+        if total > 0:
+            self.move_dup_btn.config(state=NORMAL)
+            self.del_dup_btn.config(state=NORMAL)
+            self._log(f"✅ {len(self.duplicates)} groepen, {total} duplicaten gevonden")
+            self.dup_status.config(text=f"✅ {len(self.duplicates)} groepen, {total} duplicaten", fg='#2ecc71')
+            self.dup_counter.config(text=f"Duplicaten gevonden: {total}")
+        else:
+            self._log("✅ Geen duplicaten gevonden")
+            self.dup_status.config(text="✅ Geen duplicaten gevonden", fg='#2ecc71')
+            self.dup_counter.config(text="Geen duplicaten gevonden")
+    
+    def _move_duplicates(self):
+        if not self.duplicate_dest.get():
+            messagebox.showwarning("Waarschuwing", "Selecteer een doelmap voor duplicaten")
+            return
+        
+        total = sum(len(p) - 1 for p in self.duplicates.values())
+        if total == 0:
+            messagebox.showinfo("Info", "Geen duplicaten om te verplaatsen")
+            return
+        
+        antwoord = messagebox.askyesno("Bevestiging", f"Verplaats {total} duplicaten naar:\n{self.duplicate_dest.get()}?")
+        if not antwoord:
+            return
+        
+        moved = 0
+        for paths in self.duplicates.values():
+            for dup in paths[1:]:
+                try:
+                    dest = Path(self.duplicate_dest.get()) / Path(dup).name
+                    counter = 1
+                    while dest.exists():
+                        dest = Path(self.duplicate_dest.get()) / f"{Path(dup).stem}_{counter}{Path(dup).suffix}"
+                        counter += 1
+                    shutil.move(dup, dest)
+                    moved += 1
+                    self.dup_status.config(text=f"📦 Verplaatst: {moved}/{total}")
+                    self.root.update_idletasks()
+                except Exception as e:
+                    self._log(f"❌ Fout bij verplaatsen {dup}: {e}")
+        
+        self._log(f"✅ {moved} duplicaten verplaatst naar {self.duplicate_dest.get()}")
+        messagebox.showinfo("Klaar", f"{moved} bestanden verplaatst!")
+        self._start_dup_scan()
+    
+    def _delete_duplicates(self):
+        total = sum(len(p) - 1 for p in self.duplicates.values())
+        if total == 0:
+            messagebox.showinfo("Info", "Geen duplicaten om te verwijderen")
+            return
+        
+        antwoord = messagebox.askyesno("⚠️ WAARSCHUWING", f"Permanent verwijderen van {total} bestanden?\n\nDit kan niet ongedaan worden gemaakt!")
+        if not antwoord:
+            return
+        
+        deleted = 0
+        for paths in self.duplicates.values():
+            for dup in paths[1:]:
+                try:
+                    os.chmod(dup, stat.S_IWRITE)
+                    os.remove(dup)
+                    deleted += 1
+                    self.dup_status.config(text=f"🗑️ Verwijderd: {deleted}/{total}")
+                    self.root.update_idletasks()
+                except Exception as e:
+                    self._log(f"❌ Fout bij verwijderen {dup}: {e}")
+        
+        self._log(f"✅ {deleted} duplicaten verwijderd")
+        messagebox.showinfo("Klaar", f"{deleted} bestanden verwijderd!")
+        self._start_dup_scan()
+    
+    def _save_settings(self):
+        settings = {
+            'target_base': self.target_base.get(),
+            'scan_folder': self.scan_folder.get(),
+            'duplicate_source': self.duplicate_source.get(),
+            'duplicate_dest': self.duplicate_dest.get(),
+            'ai_model': self.ai_model.get(),
+            'max_depth': self.max_depth.get()
+        }
+        try:
+            with open(Path.home() / ".ai_archiver_settings.json", 'w') as f:
+                json.dump(settings, f, indent=2)
+            self._log("💾 Instellingen opgeslagen")
+        except Exception as e:
+            self._log(f"❌ Opslaan mislukt: {e}")
+    
+    def _load_settings(self):
+        try:
+            settings_file = Path.home() / ".ai_archiver_settings.json"
+            if settings_file.exists():
+                with open(settings_file, 'r') as f:
+                    s = json.load(f)
+                self.target_base.set(s.get('target_base', ''))
+                self.scan_folder.set(s.get('scan_folder', ''))
+                self.duplicate_source.set(s.get('duplicate_source', ''))
+                self.duplicate_dest.set(s.get('duplicate_dest', ''))
+                self.ai_model.set(s.get('ai_model', 'facebook/bart-large-mnli'))
+                self.max_depth.set(s.get('max_depth', 4))
+                self._log("📂 Instellingen geladen")
+        except Exception as e:
+            self._log(f"⚠️ Laden mislukt: {e}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    root = Tk()
+    app = AIArchiverApp(root)
+    
+    def on_closing():
+        if hasattr(app, 'duplicate_finder') and app.duplicate_finder.scanning:
+            app.duplicate_finder.stop_scan = True
+            time.sleep(1)
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
