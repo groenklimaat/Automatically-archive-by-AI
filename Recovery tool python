@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""
+All-in-One Data Recovery Tool - Met Grafische Interface
+Herstel verwijderde bestanden van schijven, USB-sticks, SD-kaarten, etc.
+"""
+
+import os
+import sys
+import threading
+import time
+import hashlib
+from pathlib import Path
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+# Probeer extra bibliotheken te laden (optioneel)
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+# ===== BESTANDSSIGNATUREN =====
+class FileSignatures:
+    """Database van bestandssignaturen"""
+    
+    SIGNATURES = {
+        # Afbeeldingen
+        'jpg': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'min_size': 1024, 'desc': 'JPEG afbeelding', 'icon': '🖼️'},
+        'png': {'header': b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', 'footer': b'\x49\x45\x4E\x44\xAE\x42\x60\x82', 'min_size': 256, 'desc': 'PNG afbeelding', 'icon': '🖼️'},
+        'gif': {'header': b'\x47\x49\x46\x38', 'footer': b'\x00\x3B', 'min_size': 256, 'desc': 'GIF afbeelding', 'icon': '🖼️'},
+        'bmp': {'header': b'\x42\x4D', 'footer': None, 'min_size': 54, 'desc': 'BMP afbeelding', 'icon': '🖼️'},
+        'tiff': {'header': b'\x49\x49\x2A\x00', 'footer': None, 'min_size': 512, 'desc': 'TIFF afbeelding', 'icon': '🖼️'},
+        'webp': {'header': b'\x52\x49\x46\x46', 'footer': None, 'min_size': 512, 'desc': 'WebP afbeelding', 'icon': '🖼️'},
+        
+        # Documenten
+        'pdf': {'header': b'\x25\x50\x44\x46', 'footer': b'\x25\x25\x45\x4F\x46', 'min_size': 1024, 'desc': 'PDF document', 'icon': '📄'},
+        'docx': {'header': b'\x50\x4B\x03\x04', 'footer': None, 'min_size': 1024, 'desc': 'Word document', 'icon': '📝'},
+        'xlsx': {'header': b'\x50\x4B\x03\x04', 'footer': None, 'min_size': 1024, 'desc': 'Excel spreadsheet', 'icon': '📊'},
+        'pptx': {'header': b'\x50\x4B\x03\x04', 'footer': None, 'min_size': 1024, 'desc': 'PowerPoint presentatie', 'icon': '📽️'},
+        'txt': {'header': None, 'footer': None, 'min_size': 64, 'desc': 'Tekstbestand', 'icon': '📃'},
+        
+        # Archieven
+        'zip': {'header': b'\x50\x4B\x03\x04', 'footer': b'\x50\x4B\x05\x06', 'min_size': 1024, 'desc': 'ZIP archief', 'icon': '📦'},
+        'rar': {'header': b'\x52\x61\x72\x21\x1A\x07\x00', 'footer': None, 'min_size': 1024, 'desc': 'RAR archief', 'icon': '📦'},
+        '7z': {'header': b'\x37\x7A\xBC\xAF\x27\x1C', 'footer': None, 'min_size': 1024, 'desc': '7Z archief', 'icon': '📦'},
+        
+        # Audio
+        'mp3': {'header': b'\xFF\xFB', 'footer': None, 'min_size': 512, 'desc': 'MP3 audio', 'icon': '🎵'},
+        'wav': {'header': b'\x52\x49\x46\x46', 'footer': None, 'min_size': 512, 'desc': 'WAV audio', 'icon': '🎵'},
+        'flac': {'header': b'\x66\x4C\x61\x43', 'footer': None, 'min_size': 512, 'desc': 'FLAC audio', 'icon': '🎵'},
+        'aac': {'header': b'\xFF\xF1', 'footer': None, 'min_size': 512, 'desc': 'AAC audio', 'icon': '🎵'},
+        
+        # Video
+        'mp4': {'header': b'\x00\x00\x00\x18\x66\x74\x79\x70', 'footer': None, 'min_size': 1024, 'desc': 'MP4 video', 'icon': '🎬'},
+        'avi': {'header': b'\x52\x49\x46\x46', 'footer': None, 'min_size': 1024, 'desc': 'AVI video', 'icon': '🎬'},
+        'mkv': {'header': b'\x1A\x45\xDF\xA3', 'footer': None, 'min_size': 1024, 'desc': 'MKV video', 'icon': '🎬'},
+        'mov': {'header': b'\x00\x00\x00\x14\x66\x74\x79\x70\x71\x74', 'footer': None, 'min_size': 1024, 'desc': 'MOV video', 'icon': '🎬'},
+        
+        # Uitvoerbaar
+        'exe': {'header': b'\x4D\x5A', 'footer': None, 'min_size': 1024, 'desc': 'Windows programma', 'icon': '⚙️'},
+        'elf': {'header': b'\x7F\x45\x4C\x46', 'footer': None, 'min_size': 1024, 'desc': 'Linux programma', 'icon': '⚙️'},
+    }
+
+# ===== DATA RECOVERY ENGINE =====
+class DataRecoveryEngine:
+    """Data herstel engine"""
+    
+    def __init__(self, callback=None):
+        self.callback = callback
+        self.running = False
+        self.files_found = 0
+        self.files_recovered = 0
+        self.bytes_read = 0
+        self.source_size = 0
+        
+    def log(self, message, level='info'):
+        """Log bericht via callback"""
+        if self.callback:
+            self.callback(message, level)
+    
+    def detect_file_type(self, data):
+        """Detecteer bestandstype op basis van magic bytes"""
+        for ext, sig in FileSignatures.SIGNATURES.items():
+            header = sig.get('header')
+            if header and data.startswith(header):
+                return ext
+        return None
+    
+    def recover_file(self, file_data, file_ext, counter, output_dir):
+        """Sla hersteld bestand op"""
+        if not file_data or not self.running:
+            return False
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"recovered_{timestamp}_{counter:05d}.{file_ext}"
+        filepath = Path(output_dir) / filename
+        
+        # Voorkom overschrijven
+        count = 1
+        while filepath.exists():
+            filename = f"recovered_{timestamp}_{counter:05d}_{count}.{file_ext}"
+            filepath = Path(output_dir) / filename
+            count += 1
+        
+        try:
+            filepath.write_bytes(file_data)
+            self.files_recovered += 1
+            self.log(f"✓ Hersteld: {filename} ({len(file_data):,} bytes)", 'success')
+            return True
+        except Exception as e:
+            self.log(f"✗ Fout: {filename} - {e}", 'error')
+            return False
+    
+    def scan_device(self, source_path, output_dir, file_types, block_size=4096):
+        """Scan een apparaat of schijf"""
+        self.running = True
+        self.files_found = 0
+        self.files_recovered = 0
+        self.bytes_read = 0
+        
+        # Filter signatures
+        signatures = {ext: sig for ext, sig in FileSignatures.SIGNATURES.items() if ext in file_types}
+        
+        try:
+            source = Path(source_path)
+            self.log(f"🔍 Scannen: {source}", 'info')
+            self.log(f"📁 Uitvoer: {output_dir}", 'info')
+            self.log(f"📋 Bestandstypen: {', '.join(file_types)}", 'info')
+            self.log("-" * 60, 'info')
+            
+            # Bepaal bron grootte
+            try:
+                if source.is_file() or source.is_dir():
+                    self.source_size = sum(f.stat().st_size for f in source.rglob('*') if f.is_file()) if source.is_dir() else source.stat().st_size
+                else:
+                    self.source_size = os.path.getsize(source_path)
+            except:
+                self.source_size = 0
+            
+            self.log(f"📊 Bron grootte: {self.source_size:,} bytes", 'info')
+            
+            # Scan op basis van type
+            if source.is_file():
+                self._scan_file(source, output_dir, signatures)
+            elif source.is_dir():
+                self._scan_directory(source, output_dir, signatures)
+            else:
+                self._scan_device_raw(source_path, output_dir, signatures, block_size)
+            
+            # Samenvatting
+            self.log("-" * 60, 'info')
+            self.log("✅ SCAN VOLTOOID!", 'success')
+            self.log(f"  Bestanden gevonden: {self.files_found}", 'info')
+            self.log(f"  Bestanden hersteld: {self.files_recovered}", 'success')
+            self.log(f"  Totaal gelezen: {self.bytes_read:,} bytes", 'info')
+            if self.source_size:
+                self.log(f"  Dekking: {self.bytes_read/self.source_size*100:.1f}%", 'info')
+            
+        except Exception as e:
+            self.log(f"❌ Fout: {e}", 'error')
+        finally:
+            self.running = False
+    
+    def _scan_file(self, source, output_dir, signatures):
+        """Scan een enkel bestand"""
+        with open(source, 'rb') as f:
+            data = f.read()
+            self.bytes_read = len(data)
+            file_ext = self.detect_file_type(data)
+            if file_ext and file_ext in signatures:
+                self.files_found += 1
+                self.recover_file(data, file_ext, self.files_found, output_dir)
+    
+    def _scan_directory(self, source, output_dir, signatures):
+        """Scan een directory"""
+        for file_path in source.rglob('*'):
+            if file_path.is_file() and self.running:
+                try:
+                    with open(file_path, 'rb') as f:
+                        data = f.read(1024)  # Lees alleen header
+                        self.bytes_read += len(data)
+                        file_ext = self.detect_file_type(data)
+                        if file_ext and file_ext in signatures:
+                            self.files_found += 1
+                            # Lees volledig bestand
+                            f.seek(0)
+                            full_data = f.read()
+                            self.recover_file(full_data, file_ext, self.files_found, output_dir)
+                except Exception as e:
+                    pass
+    
+    def _scan_device_raw(self, source_path, output_dir, signatures, block_size):
+        """Scan een raw device"""
+        try:
+            with open(source_path, 'rb') as device:
+                position = 0
+                buffer = bytearray()
+                
+                while self.running:
+                    chunk = device.read(block_size)
+                    if not chunk:
+                        break
+                    
+                    position += len(chunk)
+                    self.bytes_read += len(chunk)
+                    buffer.extend(chunk)
+                    
+                    # Voortgang
+                    if self.source_size and position % (block_size * 256) == 0:
+                        progress = (position / self.source_size) * 100
+                        self.log(f"Voortgang: {position:,} / {self.source_size:,} bytes ({progress:.1f}%)", 'progress')
+                    
+                    # Zoek naar signatures
+                    for ext, sig in signatures.items():
+                        header = sig.get('header')
+                        if not header:
+                            continue
+                        
+                        header_pos = buffer.find(header)
+                        if header_pos != -1:
+                            self.files_found += 1
+                            actual_pos = position - len(buffer) + header_pos
+                            device.seek(actual_pos)
+                            
+                            file_data = self._read_until_footer(device, sig)
+                            if file_data:
+                                self.recover_file(file_data, ext, self.files_found, output_dir)
+                                device.seek(actual_pos + len(file_data))
+                                position = actual_pos + len(file_data)
+                            
+                            buffer = bytearray()
+                            break
+                    
+                    if len(buffer) > block_size * 4:
+                        buffer = buffer[-block_size:]
+            
+        except PermissionError:
+            self.log("❌ Geen toegang! Voer uit als Administrator", 'error')
+    
+    def _read_until_footer(self, device, signature):
+        """Lees tot footer gevonden is"""
+        footer = signature.get('footer')
+        max_size = 100 * 1024 * 1024  # 100MB limiet
+        min_size = signature.get('min_size', 0)
+        
+        data = bytearray()
+        while len(data) < max_size and self.running:
+            chunk = device.read(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+            
+            if footer:
+                footer_pos = data.find(footer)
+                if footer_pos != -1:
+                    return data[:footer_pos + len(footer)]
+        
+        return bytes(data) if len(data) >= min_size else None
+    
+    def stop(self):
+        """Stop het scannen"""
+        self.running = False
+
+# ===== GUI APPLICATIE =====
+class DataRecoveryGUI:
+    """Grafische interface voor data recovery"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🔍 Data Recovery Tool")
+        self.root.geometry("900x650")
+        self.root.resizable(True, True)
+        
+        # Stijlen
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Variabelen
+        self.source_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+        self.scanning = False
+        self.engine = None
+        self.thread = None
+        
+        # Maak interface
+        self._create_widgets()
+        
+        # Laat beschikbare schijven zien
+        self._update_drives()
+    
+    def _create_widgets(self):
+        """Maak alle GUI widgets"""
+        
+        # Hoofdcontainer
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # ===== BRON SELECTIE =====
+        source_frame = ttk.LabelFrame(main_frame, text="📂 Bron (schijf of map)", padding="10")
+        source_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Schijf selectie
+        drive_frame = ttk.Frame(source_frame)
+        drive_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(drive_frame, text="Schijf:").pack(side=tk.LEFT, padx=(0, 5))
+        self.drive_combo = ttk.Combobox(drive_frame, state="readonly", width=10)
+        self.drive_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self.drive_combo.bind('<<ComboboxSelected>>', self._on_drive_selected)
+        
+        ttk.Button(drive_frame, text="📁 Bladeren...", command=self._browse_source).pack(side=tk.LEFT)
+        
+        # Bron pad
+        path_frame = ttk.Frame(source_frame)
+        path_frame.pack(fill=tk.X)
+        
+        ttk.Label(path_frame, text="Pad:").pack(side=tk.LEFT, padx=(0, 5))
+        self.source_entry = ttk.Entry(path_frame, textvariable=self.source_var, width=60)
+        self.source_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # ===== UITVOER SELECTIE =====
+        output_frame = ttk.LabelFrame(main_frame, text="💾 Uitvoermap", padding="10")
+        output_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        out_path_frame = ttk.Frame(output_frame)
+        out_path_frame.pack(fill=tk.X)
+        
+        ttk.Label(out_path_frame, text="Map:").pack(side=tk.LEFT, padx=(0, 5))
+        self.output_entry = ttk.Entry(out_path_frame, textvariable=self.output_var, width=60)
+        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(out_path_frame, text="📁 Bladeren...", command=self._browse_output).pack(side=tk.LEFT)
+        
+        # ===== BESTANDSTYPEN =====
+        type_frame = ttk.LabelFrame(main_frame, text="📋 Bestandstypen", padding="10")
+        type_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Selectie knoppen
+        btn_frame = ttk.Frame(type_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Button(btn_frame, text="✅ Alles selecteren", command=self._select_all_types).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="❌ Alles deselecteren", command=self._deselect_all_types).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="🖼️ Alleen afbeeldingen", command=self._select_images).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="📄 Alleen documenten", command=self._select_documents).pack(side=tk.LEFT)
+        
+        # Checkboxes voor bestandstypen
+        self.type_vars = {}
+        type_container = ttk.Frame(type_frame)
+        type_container.pack(fill=tk.X)
+        
+        # Toon checkboxes in kolommen
+        row_frame = ttk.Frame(type_container)
+        row_frame.pack(fill=tk.X)
+        
+        col = 0
+        for i, (ext, sig) in enumerate(FileSignatures.SIGNATURES.items()):
+            if i % 8 == 0 and i > 0:
+                row_frame = ttk.Frame(type_container)
+                row_frame.pack(fill=tk.X)
+            
+            var = tk.BooleanVar(value=True)
+            self.type_vars[ext] = var
+            cb = ttk.Checkbutton(row_frame, text=f"{sig['icon']} {ext}", variable=var)
+            cb.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # ===== SCAN KNOOP =====
+        control_frame = ttk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.scan_btn = ttk.Button(control_frame, text="🚀 Start Scan", command=self._start_scan, style="Accent.TButton")
+        self.scan_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.stop_btn = ttk.Button(control_frame, text="⏹️ Stop", command=self._stop_scan, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT)
+        
+        # Voortgangsbalk
+        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress.pack(fill=tk.X, pady=(0, 5))
+        
+        # ===== LOG VOORBEELD =====
+        log_frame = ttk.LabelFrame(main_frame, text="📝 Logboek", padding="5")
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=12, font=('Consolas', 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Log kleuren
+        self.log_text.tag_config('info', foreground='white')
+        self.log_text.tag_config('success', foreground='#00ff00')
+        self.log_text.tag_config('error', foreground='#ff4444')
+        self.log_text.tag_config('progress', foreground='#ffff00')
+        self.log_text.tag_config('warning', foreground='#ff8800')
+        
+        # Clear log knop
+        clear_frame = ttk.Frame(log_frame)
+        clear_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(clear_frame, text="🗑️ Log wissen", command=self._clear_log).pack(side=tk.RIGHT)
+    
+    def _update_drives(self):
+        """Update lijst van beschikbare schijven"""
+        drives = []
+        
+        if HAS_PSUTIL:
+            for partition in psutil.disk_partitions():
+                if partition.device:
+                    drives.append(partition.device)
+        else:
+            # Fallback voor Windows
+            if sys.platform == 'win32':
+                import string
+                from ctypes import windll
+                for letter in string.ascii_uppercase:
+                    path = f"{letter}:\\"
+                    if windll.kernel32.GetDriveTypeW(path) > 1:
+                        drives.append(path)
+            else:
+                # Linux/Mac
+                drives = ['/dev/sda', '/dev/sdb', '/dev/sdc']
+        
+        self.drive_combo['values'] = drives
+        if drives:
+            self.drive_combo.current(0)
+            self.source_var.set(drives[0])
+    
+    def _on_drive_selected(self, event):
+        """Bij selectie van een schijf"""
+        self.source_var.set(self.drive_combo.get())
+    
+    def _browse_source(self):
+        """Blader voor bron"""
+        if sys.platform == 'win32':
+            path = filedialog.askdirectory(title="Selecteer bronmap")
+        else:
+            path = filedialog.askdirectory(title="Selecteer bronmap")
+        
+        if path:
+            self.source_var.set(path)
+    
+    def _browse_output(self):
+        """Blader voor uitvoermap"""
+        path = filedialog.askdirectory(title="Selecteer uitvoermap")
+        if path:
+            self.output_var.set(path)
+    
+    def _select_all_types(self):
+        """Selecteer alle bestandstypen"""
+        for var in self.type_vars.values():
+            var.set(True)
+    
+    def _deselect_all_types(self):
+        """Deselecteer alle bestandstypen"""
+        for var in self.type_vars.values():
+            var.set(False)
+    
+    def _select_images(self):
+        """Selecteer alleen afbeeldingen"""
+        image_types = ['jpg', 'png', 'gif', 'bmp', 'tiff', 'webp']
+        for ext, var in self.type_vars.items():
+            var.set(ext in image_types)
+    
+    def _select_documents(self):
+        """Selecteer alleen documenten"""
+        doc_types = ['pdf', 'docx', 'xlsx', 'pptx', 'txt']
+        for ext, var in self.type_vars.items():
+            var.set(ext in doc_types)
+    
+    def _get_selected_types(self):
+        """Haal geselecteerde bestandstypen op"""
+        return [ext for ext, var in self.type_vars.items() if var.get()]
+    
+    def _start_scan(self):
+        """Start het scanproces"""
+        source = self.source_var.get().strip()
+        output = self.output_var.get().strip()
+        
+        if not source:
+            messagebox.showerror("Fout", "Selecteer een bron (schijf of map)")
+            return
+        
+        if not output:
+            messagebox.showerror("Fout", "Selecteer een uitvoermap")
+            return
+        
+        if not os.path.exists(source):
+            messagebox.showerror("Fout", f"Bron bestaat niet: {source}")
+            return
+        
+        # Maak uitvoermap aan
+        Path(output).mkdir(parents=True, exist_ok=True)
+        
+        # Check of er bestandstypen geselecteerd zijn
+        selected_types = self._get_selected_types()
+        if not selected_types:
+            messagebox.showerror("Fout", "Selecteer ten minste één bestandstype")
+            return
+        
+        # Bevestiging voor grote schijven
+        try:
+            if os.path.exists(source):
+                size = os.path.getsize(source) if os.path.isfile(source) else 0
+                if size > 1024 * 1024 * 1024:  # > 1GB
+                    if not messagebox.askyesno("Bevestiging", 
+                        f"Bron is {size/(1024**3):.1f} GB groot.\nDit kan lang duren.\nDoorgaan?"):
+                        return
+        except:
+            pass
+        
+        # Start scanning in aparte thread
+        self.scanning = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.progress.start()
+        
+        self._log("🚀 Starten met scannen...", 'info')
+        
+        # Maak engine
+        self.engine = DataRecoveryEngine(callback=self._log)
+        
+        # Start thread
+        self.thread = threading.Thread(
+            target=self._scan_thread,
+            args=(source, output, selected_types)
+        )
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def _scan_thread(self, source, output, selected_types):
+        """Scan thread"""
+        try:
+            self.engine.scan_device(source, output, selected_types)
+        except Exception as e:
+            self._log(f"❌ Fout: {e}", 'error')
+        finally:
+            self.root.after(0, self._scan_finished)
+    
+    def _stop_scan(self):
+        """Stop het scannen"""
+        if self.engine:
+            self.engine.stop()
+            self._log("⏹️ Gestopt door gebruiker", 'warning')
+            self.stop_btn.config(state=tk.DISABLED)
+    
+    def _scan_finished(self):
+        """Scan is voltooid"""
+        self.scanning = False
+        self.scan_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.progress.stop()
+        self._log("✅ Klaar!", 'success')
+    
+    def _log(self, message, level='info'):
+        """Voeg bericht toe aan log"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        
+        # Icoon voor level
+        icons = {
+            'info': 'ℹ️',
+            'success': '✅',
+            'error': '❌',
+            'warning': '⚠️',
+            'progress': '⏳'
+        }
+        
+        formatted = f"[{timestamp}] {message}\n"
+        self.log_text.insert(tk.END, formatted, level)
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+    
+    def _clear_log(self):
+        """Wis het logboek"""
+        self.log_text.delete(1.0, tk.END)
+
+# ===== MAIN =====
+def main():
+    root = tk.Tk()
+    app = DataRecoveryGUI(root)
+    
+    # Stel standaard uitvoermap in
+    desktop = Path.home() / "Desktop"
+    if desktop.exists():
+        app.output_var.set(str(desktop / "Recovered_Files"))
+    else:
+        app.output_var.set(str(Path.cwd() / "Recovered_Files"))
+    
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
