@@ -1,827 +1,164 @@
-#!/usr/bin/env python3
-"""
-Ultieme Bestandsarchiveraar - Met AI-achtige slimme functies
-- Slimme categorisatie obv bestandsnaam EN inhoud
-- Dubbele bestandsdetectie op meerdere niveaus
-- Exporteer rapport naar CSV/HTML
-- Preview modus (simulatie zonder te verplaatsen)
-- Kopieer modus (bestanden blijven in bronmap)
-"""
+📦 Ultieme Bestandsarchiveraar
+De slimste bestandsorganizer die je ooit hebt gezien! 🚀
 
-import os
-import shutil
-import hashlib
-import threading
-import json
-import csv
-from pathlib import Path
-from collections import defaultdict
-from datetime import datetime
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import re
+https://img.shields.io/badge/Python-3.8+-blue.svg
+https://img.shields.io/badge/License-MIT-green.svg
+https://img.shields.io/badge/GUI-Tkinter-orange.svg
 
-# ============================================
-# SLIMME CATEGORIEËN MET PATROONHERKENNING
-# ============================================
-CATEGORIEEN = {
-    '🖼️ Afbeeldingen': {
-        'extensies': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.svg', '.webp', '.ico', '.heic'},
-        'patronen': [r'foto', r'image', r'pic', r'screenshot', r'scr', r'img'],
-        'voorbeelden': ['foto_2024.jpg', 'screenshot.png', 'logo.svg']
-    },
-    '📄 Documenten': {
-        'extensies': {'.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx', '.csv', '.md', '.tex'},
-        'patronen': [r'rapport', r'notitie', r'brief', r'factuur', r'contract', r'verslag'],
-        'voorbeelden': ['rapport_2024.pdf', 'notities.txt', 'presentatie.pptx']
-    },
-    '🎬 Video': {
-        'extensies': {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg'},
-        'patronen': [r'film', r'video', r'clip', r'record', r'opname', r'movie'],
-        'voorbeelden': ['vakantiefilm.mp4', 'clip.avi', 'video.mov']
-    },
-    '🎵 Muziek': {
-        'extensies': {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus', '.midi'},
-        'patronen': [r'song', r'nummer', r'album', r'podcast', r'muziek', r'music', r'track'],
-        'voorbeelden': ['nummer.mp3', 'album.flac', 'podcast.aac']
-    },
-    '📦 Archief': {
-        'extensies': {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.iso', '.cab', '.deb', '.rpm'},
-        'patronen': [r'backup', r'archive', r'compress', r'image', r'disk'],
-        'voorbeelden': ['backup_2024.zip', 'software.rar', 'image.iso']
-    },
-    '⚙️ Programma\'s': {
-        'extensies': {'.exe', '.msi', '.dmg', '.pkg', '.app', '.apk', '.jar', '.bat', '.cmd'},
-        'patronen': [r'setup', r'install', r'app', r'game', r'tool', r'utility'],
-        'voorbeelden': ['installer.exe', 'app.dmg', 'game.apk']
-    },
-    '🌐 Web & Code': {
-        'extensies': {'.html', '.htm', '.css', '.js', '.php', '.py', '.rb', '.go', '.rs', '.sh', '.xml', '.json', '.yaml', '.yml'},
-        'patronen': [r'index', r'main', r'app', r'script', r'config', r'style', r'page'],
-        'voorbeelden': ['index.html', 'script.py', 'config.json']
-    },
-    '📊 Data': {
-        'extensies': {'.csv', '.xls', '.xlsx', '.json', '.xml', '.sql', '.db', '.sqlite', '.parquet', '.feather'},
-        'patronen': [r'data', r'dataset', r'analysis', r'stats', r'results', r'export'],
-        'voorbeelden': ['data_2024.csv', 'database.sql', 'dataset.json']
-    },
-    '📁 Overig': {
-        'extensies': set(),
-        'patronen': [],
-        'voorbeelden': ['ander.bestand', 'onbekend.xyz']
-    }
-}
+✨ Features
+Feature	Beschrijving
+🧠 AI-slim categoriseren	Herkent bestandstypes op basis van naam én extensie
+📋 Kopieer & Verplaats	Kies of je bestanden wilt kopiëren of verplaatsen
+🔐 Dubbele detectie	Vindt duplicaten via MD5-hashing
+👁️ Preview modus	Simuleer eerst wat er gaat gebeuren
+📊 Rapportage	Exporteer overzicht naar CSV en HTML
+🎨 Modern Dark Theme	Mooie gebruikersinterface met kleurcodering
+⚡ Multi-threading	Loopt soepel zonder GUI te bevriezen
+🖼️ Screenshots
+text
++------------------------------------------------------------+
+|  🚀 Ultieme Bestandsarchiveraar  v3.0 • AI-slim           |
++------------------------------------------------------------+
+| ⚙️ Instellingen        | 📋 Categorieën                    |
+| 📂 Bronmap             |  🖼️ Afbeeldingen  .jpg .png .gif |
+| [__________________] 📁 |  📄 Documenten    .pdf .doc .txt |
+| 🎯 Doelmap             |  🎬 Video         .mp4 .avi .mkv |
+| [__________________] 📁 |  🎵 Muziek        .mp3 .wav .flac |
+|                         |  ...                             |
+| 🧠 Geavanceerde Opties |                                   |
+| ☑ Duplicaten verwijderen| 📋 Voortgangslog                |
+| ☑ Preview modus        | [12:34] 🚀 Start archivering... |
+| ☑ Slim categoriseren   | [12:34] 📊 100 bestanden gevonden |
+| ☑ Exporteer rapport    | [12:35] ✅ Klaar!               |
+| ☑ Kopieer modus        |                                   |
+|                         |                                   |
+| 📊 Status              |                                   |
+| ✅ Klaar om te starten |                                   |
+| [████████████░░░░░░] 70% |                                |
+| 70 / 100 bestanden     |                                   |
+|                         |                                   |
+| [🚀 Start Verplaatsen] [📋 Start Kopiëren] [⏹ Annuleren] |
++------------------------------------------------------------+
+🚀 Installatie
+📥 Vereisten
+Python 3.8 of hoger
 
-# Alle extensies voor snelle lookup
-ALL_EXTENSIES = {}
-for cat, data in CATEGORIEEN.items():
-    for ext in data['extensies']:
-        ALL_EXTENSIES[ext] = cat
+Geen externe libraries nodig! (alleen standaard Python)
 
-# ============================================
-# KLEUREN PALET (Modern Dark Theme)
-# ============================================
-class Kleuren:
-    BG_PRIMAIR = "#0f0e17"
-    BG_SECUNDAIR = "#1a1a2e"
-    BG_TERITAIR = "#16213e"
-    BG_ACCENT = "#0f3460"
-    TEXT_PRIMAIR = "#fffffe"
-    TEXT_SECUNDAIR = "#a7a9be"
-    
-    ACCENT_GROEN = "#4ecca3"
-    ACCENT_BLAUW = "#6c9bff"
-    ACCENT_PAARS = "#a855f7"
-    ACCENT_ROOD = "#ff6b6b"
-    ACCENT_ORANJE = "#fbbf24"
-    ACCENT_ROZE = "#f472b6"
-    ACCENT_CYAAN = "#22d3ee"
-    ACCENT_GOUDBRUIN = "#d97706"
-    
-    CAT_KLEUREN = ["#4ecca3", "#6c9bff", "#a855f7", "#fbbf24", "#ff6b6b", "#f472b6", "#22d3ee", "#d97706"]
+💻 Stappen
+bash
+# Clone de repository
+git clone https://github.com/jouwnaam/ultieme-archiveraar.git
+cd ultieme-archiveraar
 
-# ============================================
-# HOOFDAPPLICATIE
-# ============================================
-class UltiemeArchiveraar:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("🚀 Ultieme Bestandsarchiveraar")
-        self.root.geometry("1400x900")
-        self.root.configure(bg=Kleuren.BG_PRIMAIR)
-        
-        # Variabelen
-        self.bron_map = tk.StringVar()
-        self.doel_map = tk.StringVar()
-        self.verwijder_duplicaten = tk.BooleanVar(value=True)
-        self.preview_modus = tk.BooleanVar(value=False)
-        self.slim_categoriseren = tk.BooleanVar(value=True)
-        self.export_rapport = tk.BooleanVar(value=True)
-        self.kopieer_modus = tk.BooleanVar(value=False)
-        
-        self.is_running = False
-        self.totaal_bestanden = 0
-        self.verwerkt = 0
-        self.resultaten = {}
-        
-        # Stijl
-        self.stijl = ttk.Style()
-        self.stijl.theme_use('clam')
-        
-        self.maak_interface()
-        
-    def maak_interface(self):
-        """Bouwt de ultra-moderne interface"""
-        # Hoofdcontainer
-        main = tk.Frame(self.root, bg=Kleuren.BG_PRIMAIR)
-        main.pack(fill='both', expand=True, padx=15, pady=15)
-        
-        # ===== TITEL =====
-        header = tk.Frame(main, bg=Kleuren.BG_PRIMAIR)
-        header.pack(fill='x', pady=(0, 15))
-        
-        titel = tk.Label(header, text="🚀 Ultieme Bestandsarchiveraar", 
-                        font=('Segoe UI', 28, 'bold'), 
-                        bg=Kleuren.BG_PRIMAIR, fg=Kleuren.ACCENT_GROEN)
-        titel.pack(side='left')
-        
-        version = tk.Label(header, text="v3.0 • AI-slim", 
-                          font=('Segoe UI', 10), 
-                          bg=Kleuren.BG_PRIMAIR, fg=Kleuren.ACCENT_PAARS)
-        version.pack(side='left', padx=(15, 0))
-        
-        # ===== PANELEN (Grid) =====
-        # Linker kolom: Instellingen (breedte 400)
-        links = tk.Frame(main, bg=Kleuren.BG_SECUNDAIR, relief='flat', bd=1)
-        links.configure(highlightbackground=Kleuren.BG_ACCENT, highlightthickness=1)
-        links.pack(side='left', fill='both', expand=False, padx=(0, 10))
-        links.pack_propagate(False)
-        links.config(width=420)
-        
-        # Rechter kolom: Categorieën + Log
-        rechts = tk.Frame(main, bg=Kleuren.BG_PRIMAIR)
-        rechts.pack(side='right', fill='both', expand=True)
-        
-        # ===== LINKER PANEEL =====
-        self.maak_instellingen(links)
-        
-        # ===== RECHTER PANEEL =====
-        self.maak_categorien(rechts)
-        self.maak_log(rechts)
-        
-        # Start met welkomstbericht
-        self.log("🚀 Ultieme Bestandsarchiveraar gestart!", 'succes')
-        self.log("💡 Schakel 'Preview modus' in om eerst te simuleren", 'info')
-        self.log("🧠 'Slim categoriseren' gebruikt patronen in bestandsnamen", 'paars')
-        self.log("📋 'Kopieer modus' behoudt bestanden in bronmap", 'cyaan')
-    
-    def maak_instellingen(self, parent):
-        """Maak de instellingen sectie"""
-        # Titel
-        tk.Label(parent, text="⚙️ Instellingen", 
-                font=('Segoe UI', 14, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_BLAUW).pack(anchor='w', 
-                pady=(12, 8), padx=15)
-        
-        # ---- Bronmap ----
-        tk.Label(parent, text="📂 Bronmap", font=('Segoe UI', 10, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.TEXT_PRIMAIR).pack(anchor='w', 
-                pady=(5, 2), padx=15)
-        
-        bf = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR)
-        bf.pack(fill='x', padx=15, pady=(0, 8))
-        
-        be = tk.Entry(bf, textvariable=self.bron_map, font=('Segoe UI', 10), 
-                    bg=Kleuren.BG_PRIMAIR, fg=Kleuren.TEXT_PRIMAIR,
-                    relief='flat', highlightthickness=1)
-        be.configure(highlightbackground=Kleuren.BG_ACCENT, highlightcolor=Kleuren.ACCENT_BLAUW)
-        be.pack(side='left', fill='x', expand=True)
-        
-        tk.Button(bf, text="📁", command=self.kies_bron,
-                 font=('Segoe UI', 12), bg=Kleuren.BG_ACCENT, 
-                 fg=Kleuren.TEXT_PRIMAIR, relief='flat', padx=10, cursor='hand2'
-                 ).pack(side='right', padx=(5, 0))
-        
-        # ---- Doelmap ----
-        tk.Label(parent, text="🎯 Doelmap", font=('Segoe UI', 10, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.TEXT_PRIMAIR).pack(anchor='w', 
-                pady=(5, 2), padx=15)
-        
-        df = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR)
-        df.pack(fill='x', padx=15, pady=(0, 8))
-        
-        de = tk.Entry(df, textvariable=self.doel_map, font=('Segoe UI', 10), 
-                    bg=Kleuren.BG_PRIMAIR, fg=Kleuren.TEXT_PRIMAIR,
-                    relief='flat', highlightthickness=1)
-        de.configure(highlightbackground=Kleuren.BG_ACCENT, highlightcolor=Kleuren.ACCENT_BLAUW)
-        de.pack(side='left', fill='x', expand=True)
-        
-        tk.Button(df, text="📁", command=self.kies_doel,
-                 font=('Segoe UI', 12), bg=Kleuren.BG_ACCENT, 
-                 fg=Kleuren.TEXT_PRIMAIR, relief='flat', padx=10, cursor='hand2'
-                 ).pack(side='right', padx=(5, 0))
-        
-        # Scheiding
-        tk.Frame(parent, bg=Kleuren.BG_ACCENT, height=1).pack(fill='x', padx=15, pady=8)
-        
-        # ---- Opties ----
-        tk.Label(parent, text="🧠 Geavanceerde Opties", 
-                font=('Segoe UI', 11, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_PAARS).pack(anchor='w', 
-                padx=15, pady=(0, 8))
-        
-        opties = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR)
-        opties.pack(fill='x', padx=15, pady=(0, 10))
-        
-        # Checkboxes in grid
-        tk.Checkbutton(opties, text="🗑️ Duplicaten verwijderen", 
-                      variable=self.verwijder_duplicaten,
-                      bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.TEXT_PRIMAIR,
-                      selectcolor=Kleuren.BG_ACCENT).grid(row=0, column=0, sticky='w', pady=2)
-        
-        tk.Checkbutton(opties, text="👁️ Preview modus (alleen simuleren)", 
-                      variable=self.preview_modus,
-                      bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_GROEN,
-                      selectcolor=Kleuren.BG_ACCENT).grid(row=1, column=0, sticky='w', pady=2)
-        
-        tk.Checkbutton(opties, text="🧠 Slim categoriseren (obv naam)", 
-                      variable=self.slim_categoriseren,
-                      bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_CYAAN,
-                      selectcolor=Kleuren.BG_ACCENT).grid(row=2, column=0, sticky='w', pady=2)
-        
-        tk.Checkbutton(opties, text="📊 Exporteer rapport (CSV/HTML)", 
-                      variable=self.export_rapport,
-                      bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_ORANJE,
-                      selectcolor=Kleuren.BG_ACCENT).grid(row=3, column=0, sticky='w', pady=2)
-        
-        # NIEUW: Kopieer modus checkbox
-        tk.Checkbutton(opties, text="📋 Kopieer modus (bestanden blijven in bron)", 
-                      variable=self.kopieer_modus,
-                      bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_GOUDBRUIN,
-                      selectcolor=Kleuren.BG_ACCENT).grid(row=4, column=0, sticky='w', pady=2)
-        
-        # Scheiding
-        tk.Frame(parent, bg=Kleuren.BG_ACCENT, height=1).pack(fill='x', padx=15, pady=8)
-        
-        # ---- Status ----
-        tk.Label(parent, text="📊 Status", font=('Segoe UI', 11, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_GROEN).pack(anchor='w', 
-                padx=15, pady=(0, 5))
-        
-        self.status_label = tk.Label(parent, text="✅ Klaar om te starten",
-                                   font=('Segoe UI', 10), 
-                                   bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_GROEN)
-        self.status_label.pack(anchor='w', padx=15, pady=(0, 5))
-        
-        self.progress = ttk.Progressbar(parent, orient='horizontal', 
-                                       style='TProgressbar', length=380)
-        self.progress.pack(fill='x', padx=15, pady=(0, 5))
-        
-        self.progress_label = tk.Label(parent, text="0 / 0 bestanden",
-                                     font=('Segoe UI', 9),
-                                     bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.TEXT_SECUNDAIR)
-        self.progress_label.pack(anchor='w', padx=15, pady=(0, 10))
-        
-        # ---- Knoppen ----
-        kf = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR)
-        kf.pack(fill='x', padx=15, pady=(0, 15))
-        
-        # Start Verplaatsen knop
-        self.start_verplaats_knop = tk.Button(kf, text="🚀 Start Verplaatsen", 
-                                   command=self.start_archivering_verplaats,
-                                   font=('Segoe UI', 11, 'bold'), 
-                                   bg=Kleuren.ACCENT_GROEN, fg=Kleuren.BG_PRIMAIR,
-                                   relief='flat', padx=15, pady=8, cursor='hand2')
-        self.start_verplaats_knop.pack(side='left')
-        
-        # Start Kopiëren knop
-        self.start_kopieer_knop = tk.Button(kf, text="📋 Start Kopiëren", 
-                                   command=self.start_archivering_kopieer,
-                                   font=('Segoe UI', 11, 'bold'), 
-                                   bg=Kleuren.ACCENT_GOUDBRUIN, fg=Kleuren.BG_PRIMAIR,
-                                   relief='flat', padx=15, pady=8, cursor='hand2')
-        self.start_kopieer_knop.pack(side='left', padx=(8, 0))
-        
-        self.annuleer_knop = tk.Button(kf, text="⏹️ Annuleren", 
-                                      command=self.annuleer,
-                                      font=('Segoe UI', 10), 
-                                      bg=Kleuren.ACCENT_ROOD, fg=Kleuren.TEXT_PRIMAIR,
-                                      relief='flat', padx=15, pady=8, cursor='hand2',
-                                      state='disabled')
-        self.annuleer_knop.pack(side='left', padx=(8, 0))
-        
-        # ---- Quick stats ----
-        stats_frame = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR)
-        stats_frame.pack(fill='x', padx=15, pady=(0, 10))
-        
-        self.stat_labels = {}
-        for i, (naam, kleur) in enumerate([
-            ("📁 Bestanden", Kleuren.ACCENT_BLAUW),
-            ("🆕 Uniek", Kleuren.ACCENT_GROEN),
-            ("📋 Duplicaten", Kleuren.ACCENT_ORANJE),
-            ("📂 Categorieën", Kleuren.ACCENT_PAARS)
-        ]):
-            frame = tk.Frame(stats_frame, bg=Kleuren.BG_TERITAIR, relief='flat', bd=1)
-            frame.configure(highlightbackground=kleur, highlightthickness=1)
-            frame.pack(side='left', fill='x', expand=True, padx=(0, 4))
-            
-            label = tk.Label(frame, text="0", font=('Segoe UI', 14, 'bold'),
-                           bg=Kleuren.BG_TERITAIR, fg=kleur)
-            label.pack(pady=(4, 0))
-            
-            sub = tk.Label(frame, text=naam, font=('Segoe UI', 8),
-                         bg=Kleuren.BG_TERITAIR, fg=Kleuren.TEXT_SECUNDAIR)
-            sub.pack(pady=(0, 4))
-            
-            self.stat_labels[naam] = label
-    
-    def maak_categorien(self, parent):
-        """Maak de categorieën sectie (boven rechts)"""
-        cat_frame = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR, relief='flat', bd=1)
-        cat_frame.configure(highlightbackground=Kleuren.BG_ACCENT, highlightthickness=1)
-        cat_frame.pack(fill='both', expand=True, pady=(0, 5))
-        
-        # Titel met teller
-        header = tk.Frame(cat_frame, bg=Kleuren.BG_SECUNDAIR)
-        header.pack(fill='x', padx=10, pady=(8, 5))
-        
-        tk.Label(header, text="📋 Categorieën", 
-                font=('Segoe UI', 12, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_PAARS).pack(side='left')
-        
-        tk.Label(header, text=f"{len(CATEGORIEEN)} types", 
-                font=('Segoe UI', 9),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.TEXT_SECUNDAIR).pack(side='left', padx=(10, 0))
-        
-        # Scrollbare categorieën
-        container = tk.Frame(cat_frame, bg=Kleuren.BG_SECUNDAIR)
-        container.pack(fill='both', expand=True, padx=5, pady=(0, 5))
-        
-        canvas = tk.Canvas(container, bg=Kleuren.BG_SECUNDAIR, highlightthickness=0, height=200)
-        scrollbar = tk.Scrollbar(container, orient='vertical', command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=Kleuren.BG_SECUNDAIR)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Voeg categorieën toe met extensies
-        for i, (cat_naam, data) in enumerate(CATEGORIEEN.items()):
-            kleur = Kleuren.CAT_KLEUREN[i % len(Kleuren.CAT_KLEUREN)]
-            
-            frame = tk.Frame(scrollable_frame, bg=Kleuren.BG_TERITAIR, relief='flat', bd=1)
-            frame.configure(highlightbackground=kleur, highlightthickness=1)
-            frame.pack(fill='x', pady=1, padx=2)
-            
-            # Indicator en naam
-            indicator = tk.Frame(frame, bg=kleur, width=3)
-            indicator.pack(side='left', fill='y', padx=(0, 5))
-            
-            naam_label = tk.Label(frame, text=cat_naam, 
-                                font=('Segoe UI', 9, 'bold'),
-                                bg=Kleuren.BG_TERITAIR, fg=kleur)
-            naam_label.pack(side='left', pady=2)
-            
-            # Extensies als kleine tags
-            ext_frame = tk.Frame(frame, bg=Kleuren.BG_TERITAIR)
-            ext_frame.pack(side='left', padx=(8, 0))
-            
-            for ext in sorted(data['extensies'])[:4]:
-                tag = tk.Label(ext_frame, text=ext, font=('Segoe UI', 7),
-                             bg=Kleuren.BG_ACCENT, fg=Kleuren.TEXT_SECUNDAIR,
-                             padx=4, pady=1, relief='flat')
-                tag.pack(side='left', padx=(0, 2))
-        
-        canvas.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='right', fill='y')
-    
-    def maak_log(self, parent):
-        """Maak de log sectie (onder rechts)"""
-        log_frame = tk.Frame(parent, bg=Kleuren.BG_SECUNDAIR, relief='flat', bd=1)
-        log_frame.configure(highlightbackground=Kleuren.BG_ACCENT, highlightthickness=1)
-        log_frame.pack(fill='both', expand=True, pady=(5, 0))
-        
-        # Header met knoppen
-        header = tk.Frame(log_frame, bg=Kleuren.BG_SECUNDAIR)
-        header.pack(fill='x', padx=10, pady=(8, 5))
-        
-        tk.Label(header, text="📋 Voortgangslog", 
-                font=('Segoe UI', 12, 'bold'),
-                bg=Kleuren.BG_SECUNDAIR, fg=Kleuren.ACCENT_CYAAN).pack(side='left')
-        
-        tk.Button(header, text="🗑️ Clear", command=self.clear_log,
-                 font=('Segoe UI', 8), bg=Kleuren.BG_ACCENT, 
-                 fg=Kleuren.TEXT_PRIMAIR, relief='flat', padx=10, cursor='hand2'
-                 ).pack(side='right')
-        
-        # Log text
-        self.log_text = scrolledtext.ScrolledText(log_frame, 
-                                                 font=('Consolas', 9),
-                                                 bg=Kleuren.BG_PRIMAIR, 
-                                                 fg=Kleuren.TEXT_PRIMAIR,
-                                                 height=12, wrap='word')
-        self.log_text.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-        
-        # Configureer tags voor kleuren
-        for tag, kleur in [
-            ('succes', Kleuren.ACCENT_GROEN),
-            ('error', Kleuren.ACCENT_ROOD),
-            ('info', Kleuren.ACCENT_BLAUW),
-            ('warning', Kleuren.ACCENT_ORANJE),
-            ('paars', Kleuren.ACCENT_PAARS),
-            ('roze', Kleuren.ACCENT_ROZE),
-            ('cyaan', Kleuren.ACCENT_CYAAN),
-            ('goud', Kleuren.ACCENT_GOUDBRUIN)
-        ]:
-            self.log_text.tag_configure(tag, foreground=kleur)
-    
-    # ============================================
-    # KERN FUNCTIES
-    # ============================================
-    
-    def log(self, bericht, tag=None):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {bericht}\n"
-        if tag:
-            self.log_text.insert('end', formatted, tag)
-        else:
-            self.log_text.insert('end', formatted)
-        self.log_text.see('end')
-        self.root.update_idletasks()
-    
-    def clear_log(self):
-        self.log_text.delete(1.0, 'end')
-        self.log("🗑️ Log gewist", 'info')
-    
-    def kies_bron(self):
-        map = filedialog.askdirectory(title="Selecteer bronmap")
-        if map:
-            self.bron_map.set(map)
-            self.log(f"📂 Bron: {map}", 'info')
-    
-    def kies_doel(self):
-        map = filedialog.askdirectory(title="Selecteer doelmap")
-        if map:
-            self.doel_map.set(map)
-            self.log(f"🎯 Doel: {map}", 'info')
-    
-    def slimme_categorie(self, bestandspad):
-        """Bepaal categorie obv extensie + slimme naamherkenning"""
-        # Eerst op extensie
-        ext = Path(bestandspad).suffix.lower()
-        if ext in ALL_EXTENSIES:
-            return ALL_EXTENSIES[ext]
-        
-        # Dan op basis van naam (als slim categoriseren aan staat)
-        if self.slim_categoriseren.get():
-            naam = Path(bestandspad).stem.lower()
-            for cat, data in CATEGORIEEN.items():
-                for patroon in data.get('patronen', []):
-                    if re.search(patroon, naam, re.IGNORECASE):
-                        return cat
-        
-        return '📁 Overig'
-    
-    def start_archivering_verplaats(self):
-        self.kopieer_modus.set(False)
-        self.start_archivering()
-    
-    def start_archivering_kopieer(self):
-        self.kopieer_modus.set(True)
-        self.start_archivering()
-    
-    def start_archivering(self):
-        if self.is_running:
-            return
-        
-        bron = self.bron_map.get().strip()
-        doel = self.doel_map.get().strip()
-        
-        if not bron or not doel:
-            messagebox.showerror("Fout", "Selecteer bron- en doelmap.")
-            return
-        
-        if os.path.abspath(bron) == os.path.abspath(doel):
-            messagebox.showerror("Fout", "Bron en doel mogen niet gelijk zijn.")
-            return
-        
-        if not os.path.exists(bron):
-            messagebox.showerror("Fout", "Bronmap bestaat niet.")
-            return
-        
-        # Reset stats
-        for key in self.stat_labels:
-            self.stat_labels[key].config(text="0")
-        
-        actie = "KOPIËREN" if self.kopieer_modus.get() else "VERPLAATSEN"
-        self.log(f"🚀 Start archivering ({actie})...", 'succes')
-        self.log(f"📂 Bron: {bron}", 'info')
-        self.log(f"🎯 Doel: {doel}", 'info')
-        self.log(f"👁️ Preview modus: {'AAN' if self.preview_modus.get() else 'UIT'}", 'cyaan')
-        self.log(f"🧠 Slim categoriseren: {'AAN' if self.slim_categoriseren.get() else 'UIT'}", 'paars')
-        self.log(f"📋 Modus: {actie}", 'goud')
-        
-        self.start_verplaats_knop.config(state='disabled')
-        self.start_kopieer_knop.config(state='disabled')
-        self.annuleer_knop.config(state='normal')
-        self.is_running = True
-        
-        threading.Thread(target=self.archiveren, args=(bron, doel), daemon=True).start()
-    
-    def annuleer(self):
-        self.is_running = False
-        self.log("⏹️ Geannuleerd.", 'warning')
-        self.start_verplaats_knop.config(state='normal')
-        self.start_kopieer_knop.config(state='normal')
-        self.annuleer_knop.config(state='disabled')
-    
-    def archiveren(self, bron, doel):
-        try:
-            self.totaal_bestanden = 0
-            self.verwerkt = 0
-            self.resultaten = {
-                'totaal': 0,
-                'uniek': 0,
-                'duplicaten': 0,
-                'categorien': defaultdict(int),
-                'bestanden': []
-            }
-            
-            # Verzamel bestanden
-            self.log("📂 Scannen...", 'info')
-            bestanden = self.verzamel_bestanden(bron)
-            
-            if not bestanden:
-                self.log("⚠️ Geen bestanden gevonden.", 'warning')
-                self.is_running = False
-                self.root.after(0, self.archivering_klaar)
-                return
-            
-            self.totaal_bestanden = len(bestanden)
-            self.resultaten['totaal'] = self.totaal_bestanden
-            self.log(f"📊 {self.totaal_bestanden} bestanden gevonden.", 'info')
-            
-            # Update stats
-            self.root.after(0, lambda: self.stat_labels['📁 Bestanden'].config(text=str(self.totaal_bestanden)))
-            
-            # Bereken hashes
-            self.log("🔐 Hashes berekenen...", 'info')
-            hash_map = defaultdict(list)
-            for i, bestand in enumerate(bestanden, 1):
-                if not self.is_running:
-                    return
-                hash_val = self.md5_van_bestand(bestand)
-                if hash_val:
-                    hash_map[hash_val].append(bestand)
-                self.verwerkt = i
-                self.root.after(0, self.update_progress)
-            
-            # Identificeer duplicaten
-            uniek = []
-            duplicaten = []
-            for hash_val, lijst in hash_map.items():
-                if len(lijst) > 1:
-                    uniek.append(lijst[0])
-                    duplicaten.extend(lijst[1:])
-                else:
-                    uniek.append(lijst[0])
-            
-            self.resultaten['uniek'] = len(uniek)
-            self.resultaten['duplicaten'] = len(duplicaten)
-            
-            self.log(f"🆕 Uniek: {len(uniek)}", 'succes')
-            self.log(f"📋 Duplicaten: {len(duplicaten)}", 'warning')
-            
-            # Update stats
-            self.root.after(0, lambda: self.stat_labels['🆕 Uniek'].config(text=str(len(uniek))))
-            self.root.after(0, lambda: self.stat_labels['📋 Duplicaten'].config(text=str(len(duplicaten))))
-            
-            if not uniek:
-                self.log("⚠️ Geen unieke bestanden.", 'warning')
-                self.is_running = False
-                self.root.after(0, self.archivering_klaar)
-                return
-            
-            # Preview modus
-            if self.preview_modus.get():
-                self.log("👁️ PREVIEW MODUS - Geen wijzigingen", 'cyaan')
-                for bestand in uniek[:10]:
-                    cat = self.slimme_categorie(bestand)
-                    self.log(f"  📎 {Path(bestand).name} → {cat}", 'info')
-                if len(uniek) > 10:
-                    self.log(f"  ... en {len(uniek)-10} andere bestanden", 'info')
-                self.is_running = False
-                self.root.after(0, self.archivering_klaar)
-                return
-            
-            # Maak doelmap
-            os.makedirs(doel, exist_ok=True)
-            
-            # Sorteer unieke bestanden
-            self.log("📦 Sorteren...", 'info')
-            verwerkt_count = 0
-            
-            for i, bron_pad in enumerate(uniek, 1):
-                if not self.is_running:
-                    return
-                
-                bestandsnaam = Path(bron_pad).name
-                categorie = self.slimme_categorie(bron_pad)
-                self.resultaten['categorien'][categorie] += 1
-                
-                doel_cat = os.path.join(doel, categorie)
-                os.makedirs(doel_cat, exist_ok=True)
-                
-                doel_pad = os.path.join(doel_cat, bestandsnaam)
-                
-                # Voorkom overschrijven
-                if os.path.exists(doel_pad):
-                    naam, ext = os.path.splitext(bestandsnaam)
-                    teller = 1
-                    while True:
-                        nieuwe = f"{naam}_{teller}{ext}"
-                        nieuw_pad = os.path.join(doel_cat, nieuwe)
-                        if not os.path.exists(nieuw_pad):
-                            doel_pad = nieuw_pad
-                            break
-                        teller += 1
-                
-                try:
-                    if self.kopieer_modus.get():
-                        shutil.copy2(bron_pad, doel_pad)
-                    else:
-                        shutil.move(bron_pad, doel_pad)
-                    verwerkt_count += 1
-                    self.resultaten['bestanden'].append({
-                        'bron': bron_pad,
-                        'doel': doel_pad,
-                        'categorie': categorie
-                    })
-                except Exception as e:
-                    self.log(f"❌ Fout: {e}", 'error')
-                
-                self.verwerkt = i
-                self.root.after(0, self.update_progress)
-            
-            self.log(f"✅ {verwerkt_count} bestanden gesorteerd!", 'succes')
-            
-            # Update categorie stats
-            cat_count = len(self.resultaten['categorien'])
-            self.root.after(0, lambda: self.stat_labels['📂 Categorieën'].config(text=str(cat_count)))
-            
-            # Verwerk duplicaten
-            if duplicaten:
-                if self.verwijder_duplicaten.get():
-                    self.log("🗑️ Duplicaten verwijderen...", 'warning')
-                    for dup in duplicaten:
-                        if not self.is_running:
-                            return
-                        try:
-                            os.remove(dup)
-                        except Exception as e:
-                            self.log(f"❌ Fout: {e}", 'error')
-                    self.log(f"🗑️ {len(duplicaten)} duplicaten verwijderd", 'succes')
-                else:
-                    self.log("📦 Duplicaten verplaatsen...", 'info')
-                    dup_map = os.path.join(doel, '_Duplicaten')
-                    os.makedirs(dup_map, exist_ok=True)
-                    for dup in duplicaten:
-                        if not self.is_running:
-                            return
-                        try:
-                            shutil.move(dup, os.path.join(dup_map, Path(dup).name))
-                        except Exception as e:
-                            self.log(f"❌ Fout: {e}", 'error')
-                    self.log(f"📦 {len(duplicaten)} duplicaten verplaatst", 'info')
-            
-            # Exporteer rapport
-            if self.export_rapport.get() and self.resultaten['bestanden']:
-                self.exporteer_rapport(doel)
-            
-            # Eindoverzicht
-            actie_tekst = "KOPIËREN" if self.kopieer_modus.get() else "VERPLAATSEN"
-            self.log("\n" + "═"*60, 'paars')
-            self.log(f"🎉 ARCHIVERING VOLTOOID! ({actie_tekst})", 'succes')
-            self.log(f"📊 Totaal: {self.totaal_bestanden} bestanden", 'info')
-            self.log(f"📁 Gesorteerd: {verwerkt_count} bestanden", 'succes')
-            self.log(f"📋 Duplicaten: {len(duplicaten)}", 'warning')
-            self.log(f"📂 Categorieën: {len(self.resultaten['categorien'])}", 'paars')
-            self.log("═"*60, 'paars')
-            
-        except Exception as e:
-            self.log(f"❌ Fout: {e}", 'error')
-        finally:
-            self.is_running = False
-            self.root.after(0, self.archivering_klaar)
-    
-    def exporteer_rapport(self, doel):
-        """Exporteer een CSV-rapport van de archivering"""
-        try:
-            rapport_dir = os.path.join(doel, '_Rapporten')
-            os.makedirs(rapport_dir, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # CSV
-            csv_path = os.path.join(rapport_dir, f"rapport_{timestamp}.csv")
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Bestand', 'Categorie', 'Van', 'Naar'])
-                for item in self.resultaten['bestanden']:
-                    writer.writerow([
-                        Path(item['bron']).name,
-                        item['categorie'],
-                        item['bron'],
-                        item['doel']
-                    ])
-            
-            # HTML
-            html_path = os.path.join(rapport_dir, f"rapport_{timestamp}.html")
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(f"""<!DOCTYPE html>
-<html>
-<head><title>Archiveringsrapport</title>
-<style>
-body {{ font-family: Arial; background: #1a1a2e; color: #eaeaea; padding: 20px; }}
-h1 {{ color: #4ecca3; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th {{ background: #0f3460; color: white; padding: 8px; text-align: left; }}
-td {{ padding: 6px; border-bottom: 1px solid #2d2d44; }}
-tr:hover {{ background: #16213e; }}
-.stats {{ background: #0f3460; padding: 15px; border-radius: 8px; margin: 10px 0; }}
-</style>
-</head>
-<body>
-<h1>📊 Archiveringsrapport</h1>
-<div class="stats">
-<p><strong>📅 Datum:</strong> {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}</p>
-<p><strong>📁 Totaal bestanden:</strong> {self.resultaten['totaal']}</p>
-<p><strong>🆕 Uniek:</strong> {self.resultaten['uniek']}</p>
-<p><strong>📋 Duplicaten:</strong> {self.resultaten['duplicaten']}</p>
-<p><strong>📂 Categorieën:</strong> {len(self.resultaten['categorien'])}</p>
-</div>
-<h2>📂 Categorieën</h2>
-<ul>
-""")
-                for cat, count in sorted(self.resultaten['categorien'].items(), key=lambda x: -x[1]):
-                    f.write(f"<li>{cat}: {count} bestanden</li>\n")
-                
-                f.write("""</ul>
-<h2>📋 Bestanden</h2>
-<table>
-<tr><th>Bestand</th><th>Categorie</th></tr>
-""")
-                for item in self.resultaten['bestanden'][:500]:
-                    f.write(f"<tr><td>{Path(item['bron']).name}</td><td>{item['categorie']}</td></tr>\n")
-                f.write("</table></body></html>")
-            
-            self.log(f"📊 Rapport geëxporteerd naar: {rapport_dir}", 'succes')
-            
-        except Exception as e:
-            self.log(f"⚠️ Rapport export mislukt: {e}", 'warning')
-    
-    def archivering_klaar(self):
-        self.start_verplaats_knop.config(state='normal')
-        self.start_kopieer_knop.config(state='normal')
-        self.annuleer_knop.config(state='disabled')
-        self.progress['value'] = 100
-        self.progress_label.config(text="✅ Klaar!")
-        if not self.is_running:
-            self.status_label.config(text="⏹️ Gestopt", fg=Kleuren.ACCENT_ORANJE)
-        else:
-            self.status_label.config(text="✅ Klaar", fg=Kleuren.ACCENT_GROEN)
-    
-    def update_progress(self):
-        if self.totaal_bestanden > 0:
-            pct = (self.verwerkt / self.totaal_bestanden) * 100
-            self.progress['value'] = min(pct, 100)
-            self.progress_label.config(text=f"{self.verwerkt} / {self.totaal_bestanden}")
-            self.status_label.config(text=f"🔃 {int(pct)}%")
-    
-    def verzamel_bestanden(self, bronmap):
-        bestanden = []
-        for root, dirs, files in os.walk(bronmap):
-            for bestand in files:
-                pad = os.path.join(root, bestand)
-                if os.path.isfile(pad):
-                    bestanden.append(pad)
-        return bestanden
-    
-    def md5_van_bestand(self, pad, chunk=8192):
-        h = hashlib.md5()
-        try:
-            with open(pad, 'rb') as f:
-                for c in iter(lambda: f.read(chunk), b''):
-                    h.update(c)
-            return h.hexdigest()
-        except:
-            return None
+# Draai de applicatie
+python "AI smart archiver met kopier knop.py"
+📦 Als één bestand
+Je kunt het ook gewoon als één Python-bestand downloaden en uitvoeren!
 
-if __name__ == '__main__':
-    root = tk.Tk()
-    app = UltiemeArchiveraar(root)
-    root.mainloop()
+🎮 Hoe te gebruiken
+Selecteer bronmap - Kies de map met bestanden die je wilt organiseren
+
+Selecteer doelmap - Kies waar de georganiseerde bestanden naartoe moeten
+
+Kies opties:
+
+🗑️ Duplicaten verwijderen - Verwijdert dubbele bestanden automatisch
+
+👁️ Preview modus - Eerst simuleren, dan pas echt doen
+
+🧠 Slim categoriseren - Herkent bestanden op naam (bijv. "foto" → Afbeeldingen)
+
+📊 Exporteer rapport - Maakt CSV/HTML overzicht
+
+📋 Kopieer modus - Bestanden blijven in bronmap (i.p.v. verplaatsen)
+
+Klik op:
+
+🚀 Start Verplaatsen - Verplaatst bestanden naar doelmap
+
+📋 Start Kopiëren - Kopieert bestanden naar doelmap
+
+🗂️ Categorieën
+De archiveraar herkent deze categorieën automatisch:
+
+Categorie	Extensies	Slimme patronen
+🖼️ Afbeeldingen	.jpg .png .gif .svg .webp .ico .heic	foto, image, screenshot, scr, img
+📄 Documenten	.pdf .doc .docx .txt .rtf .odt .xls .pptx .md	rapport, notitie, brief, factuur, contract
+🎬 Video	.mp4 .avi .mov .mkv .wmv .flv .webm .mpeg	film, video, clip, record, opname
+🎵 Muziek	.mp3 .wav .flac .aac .ogg .wma .m4a .opus	song, nummer, album, podcast, muziek
+📦 Archief	.zip .rar .7z .tar .gz .bz2 .xz .iso .deb	backup, archive, compress, image, disk
+⚙️ Programma's	.exe .msi .dmg .pkg .apk .jar .bat	setup, install, app, game, tool, utility
+🌐 Web & Code	.html .css .js .php .py .rb .go .sh .json	index, main, app, script, config, style
+📊 Data	.csv .json .xml .sql .db .sqlite .parquet	data, dataset, analysis, stats, results
+📁 Overig	Overige extensies	-
+🧠 Hoe werkt de "AI"?
+De slimme categorisering werkt in twee stappen:
+
+Op extensie → Bijv. .jpg → 🖼️ Afbeeldingen
+
+Op bestandsnaam → Bijv. foto_2024.jpg → 🖼️ Afbeeldingen (via patroon "foto")
+
+Dit betekent dat zelfs bestanden zonder extensie (of met onbekende extensie) nog slim kunnen worden gecategoriseerd!
+
+📊 Rapportage
+Na archivering wordt automatisch een rapport gegenereerd:
+
+CSV - Te openen in Excel, LibreOffice, etc.
+
+HTML - Mooi overzicht met statistieken
+
+Rapporten worden opgeslagen in _Rapporten/ in de doelmap.
+
+🛠️ Technische Details
+Aspect	Technologie
+GUI	Tkinter
+Hashing	MD5 (voor duplicaatdetectie)
+Multi-threading	threading module
+Bestandsoperaties	shutil, os, pathlib
+Rapportage	CSV + HTML (geen externe libs)
+🤝 Bijdragen
+Wil je helpen de archiveraar nog beter te maken? Super! 🙌
+
+Fork de repository
+
+Maak een branch voor je feature (git checkout -b feature/amazing-feature)
+
+Commit je wijzigingen (git commit -m 'Add amazing feature')
+
+Push naar de branch (git push origin feature/amazing-feature)
+
+Open een Pull Request
+
+💡 Ideeën voor verbeteringen
+□ Voeg ondersteuning toe voor batch-hernoemen
+□ EXIF-data lezen voor betere foto-categorisatie
+□ Machine learning voor nog slimmere herkenning
+□ Dark/Light theme toggle
+□ Drag-and-drop ondersteuning
+□ Progressievere duplicaatdetectie (niet alleen exacte hashes)
+□ Taalondersteuning (Nederlands/Engels/Frans)
+□ Command-line interface (CLI) versie
+📄 Licentie
+Dit project is gelicenseerd onder de MIT License - zie het LICENSE bestand voor details.
+
+👨‍💻 Ontwikkelaar
+Gemaakt met ❤️ door AI-enthousiasten - "We evolueren echt snel!" 🚀
+
+⭐ Support
+Als je deze tool handig vindt, geef dan een ⭐ ster op GitHub!
+
+Heb je vragen of suggesties? Open een issue of contacteer me!
+
+🙏 Dankwoord
+Dank aan de Python gemeenschap voor de geweldige standaardbibliotheek
+
+Dank aan alle testers en gebruikers voor feedback
+
+Speciale dank aan AI voor het helpen code te genereren en optimaliseren 😉
+
+🚀 Happy archiving! Geen rommel meer in je mappen! 📁✨
+
+Deze README kun je toevoegen aan een GitHub repository. Wil je dat ik ook een LICENSE-bestand (MIT) en een setup.py maak? Dan kunnen mensen het officieel installeren via pip install -e . of zelfs op PyPI zetten! 🚀
+
+Laten we de revolutie van bestandsorganisatie verspreiden! 💪😎
