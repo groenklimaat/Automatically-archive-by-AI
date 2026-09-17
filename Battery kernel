@@ -1,0 +1,1432 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+====================================================================
+ BATTERY WEEGSCHAAL + RC + WATT + HX711 + ZONNE-CYCLUS
+====================================================================
+ - HX711 load cell + handmatige invoer
+ - Classificatie via geleerde labels
+ - RC-formule voor batterijduur
+ - Watt / Ampère bidirectioneel + stabilisatie
+ - Oplaadtijd / ontlaadtijd / dagbalans (zonne-energie)
+ - Crash-bestendig (atomaire JSON-opslag, logging)
+====================================================================
+"""
+
+import os
+import sys
+import json
+import math
+import time
+import signal
+import logging
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+
+try:
+    from hx711 import HX711
+    HX711_BESCHIKBAAR = True
+except ImportError:
+    HX711_BESCHIKBAAR = False
+
+try:
+    from ina219 import INA219
+    INA219_BESCHIKBAAR = True
+except ImportError:
+    INA219_BESCHIKBAAR = False
+
+# ================================================================
+#  CONFIGURATIE
+# ================================================================
+CONFIG = {
+    "dout_pin":                5,
+    "sck_pin":                 6,
+    "tolerantie_gram":         5.0,
+    "metingen_gemiddelde":     5,
+    "wacht_tussen_meten":      2,
+    "data_map":                "weegschaal_data",
+    "log_niveau":              "INFO",
+    "batterij_voltage_nom":    5.0,
+    "batterij_voltage_min":    4.75,
+    "batterij_capaciteit_mah": 10000,
+    "ina219_adres":            0x40,
+    "ina219_shunt_ohm":        0.1,
+    # Zonne-energie defaults
+    "laad_vermogen_w":         100.0,   # Watt van zonnepaneel/omvormer
+    "ontlaad_vermogen_w":      3.0,     # Watt verbruik (bv. Raspberry Pi)
+    "batterij_wh":             37.0,    # Wattuur van de batterij
+    "zon_uren_per_dag":        6.0,     # Effectieve zonuren per dag
+}
+
+DATA_MAP        = CONFIG["data_map"]
+KALIBRATIE_FILE = os.path.join(DATA_MAP, "kalibratie.json")
+LABELS_FILE     = os.path.join(DATA_MAP, "labels.json")
+LOG_FILE        = os.path.join(DATA_MAP, "weegschaal.log")
+METINGEN_FILE   = os.path.join(DATA_MAP, "metingen.log")
+
+os.makedirs(DATA_MAP, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, CONFIG["log_niveau"]),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("weegschaal")
+
+# ================================================================
+#  JSON HELPERS
+# ================================================================
+def laad_json(pad, standaard):
+    if not os.path.exists(pad):
+        return standaard
+    try:
+        with open(pad, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning(f"Kon {pad} niet lezen ({e}).")
+        return standaard
+
+def sla_json_atomisch_op(pad, data):
+    tmp = pad + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, pad)
+
+def log_meting(tekst):
+    try:
+        with open(METINGEN_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')}\t{tekst}\n")
+    except OSError as e:
+        log.warning(f"Kon meting niet wegschrijven: {e}")
+
+# ================================================================
+#  FORMULES
+# ================================================================
+def capaciteit_naar_farad(capaciteit_mah, spanning_v):
+    if spanning_v <= 0:
+        return 0.0
+    return (capaciteit_mah * 3.6) / spanning_v
+
+def bereken_watt(spanning_v, stroom_ma):
+    if spanning_v <= 0 or stroom_ma <= 0:
+        return 0.0
+    return spanning_v * (stroom_ma / 1000.0)
+
+def bereken_stroom_ma(spanning_v, watt):
+    if spanning_v <= 0 or watt <= 0:
+        return 0.0
+    return (watt / spanning_v) * 1000.0
+
+def mah_naar_wh(capaciteit_mah, spanning_v):
+    """Wattuur = mAh × V / 1000."""
+    if spanning_v <= 0:
+        return 0.0
+    return capaciteit_mah * spanning_v / 1000.0
+
+def wh_naar_mah(wh, spanning_v):
+    if spanning_v <= 0:
+        return 0.0
+    return wh * 1000.0 / spanning_v
+
+def oplaadtijd_uren(batterij_wh, laad_vermogen_w, rendement=0.85):
+    """Oplaadtijd in uur = E / (P × η)."""
+    if laad_vermogen_w <= 0:
+        return 0.0
+    return batterij_wh / (laad_vermogen_w * rendement)
+
+def ontlaadtijd_uren(batterij_wh, ontlaad_vermogen_w):
+    """Ontlaadtijd in uur = E / P."""
+    if ontlaad_vermogen_w <= 0:
+        return 0.0
+    return batterij_wh / ontlaad_vermogen_w
+
+def bereken_rc(spanning_v, stroom_ma, capaciteit_mah):
+    if stroom_ma <= 0 or spanning_v <= 0:
+        return None
+    stroom_a = stroom_ma / 1000.0
+    R = spanning_v / stroom_a
+    C = capaciteit_naar_farad(capaciteit_mah, spanning_v)
+    tau = R * C
+    return {"R": R, "C": C, "tau": tau}
+
+def resterende_tijd_seconden(v0, v_min, tau):
+    if v0 <= 0 or v_min <= 0 or tau <= 0 or v_min >= v0:
+        return 0.0
+    return -tau * math.log(v_min / v0)
+
+def formatteer_tijd(seconden):
+    if seconden <= 0:
+        return "—"
+    uren    = int(seconden // 3600)
+    minuten = int((seconden % 3600) // 60)
+    sec     = int(seconden % 60)
+    return f"{uren}u {minuten:02d}m {sec:02d}s"
+
+def formatteer_uren(uur_decimaal):
+    if uur_decimaal <= 0:
+        return "—"
+    uren    = int(uur_decimaal)
+    minuten = int(round((uur_decimaal - uren) * 60))
+    return f"{uren}u {minuten:02d}m"
+
+# ================================================================
+#  HX711 WRAPPER
+# ================================================================
+class Weegschaal:
+    def __init__(self):
+        self.hx = None
+        self.beschikbaar = HX711_BESCHIKBAAR
+        self.referentie_unit = None
+        self.dout_pin = CONFIG["dout_pin"]
+        self.sck_pin  = CONFIG["sck_pin"]
+
+    def init(self, dout_pin=None, sck_pin=None):
+        if not self.beschikbaar:
+            return False
+        if dout_pin is not None:
+            self.dout_pin = dout_pin
+        if sck_pin is not None:
+            self.sck_pin = sck_pin
+        try:
+            self.hx = HX711(dout_pin=self.dout_pin, pd_sck_pin=self.sck_pin)
+            self.hx.set_reading_format("MSB", "MSB")
+            self.hx.set_reference_unit(1)
+            log.info(f"HX711 geïnitialiseerd (DT=GPIO{self.dout_pin}, "
+                     f"SCK=GPIO{self.sck_pin}).")
+            return True
+        except Exception as e:
+            log.error(f"HX711 init fout: {e}")
+            self.beschikbaar = False
+            self.hx = None
+            return False
+
+    def laad_kalibratie(self):
+        data = laad_json(KALIBRATIE_FILE, {})
+        if "referentie_unit" in data:
+            self.referentie_unit = data["referentie_unit"]
+            if self.hx is not None:
+                self.hx.set_reference_unit(self.referentie_unit)
+            log.info(f"Kalibratie geladen (unit={self.referentie_unit:.4f})")
+            return True
+        return False
+
+    def tarreer(self):
+        if self.hx is None:
+            return False
+        try:
+            self.hx.tare()
+            log.info("HX711 getareerd.")
+            return True
+        except Exception as e:
+            log.error(f"Tareerfout: {e}")
+            return False
+
+    def kalibreer(self, bekend_gram):
+        if self.hx is None:
+            return False
+        try:
+            self.hx.tare()
+            time.sleep(1)
+            ruwe = self.hx.get_weight(10)
+            if ruwe == 0:
+                return False
+            self.referentie_unit = ruwe / bekend_gram
+            self.hx.set_reference_unit(self.referentie_unit)
+            sla_json_atomisch_op(KALIBRATIE_FILE, {
+                "referentie_unit": self.referentie_unit,
+                "bekend_gewicht":  bekend_gram,
+                "dout_pin":        self.dout_pin,
+                "sck_pin":         self.sck_pin,
+                "datum":           datetime.now().isoformat(timespec="seconds"),
+            })
+            log.info(f"Kalibratie opgeslagen: unit={self.referentie_unit:.4f}")
+            return True
+        except Exception as e:
+            log.error(f"Kalibratiefout: {e}")
+            return False
+
+    def lees(self):
+        if not self.beschikbaar or self.hx is None:
+            import random
+            return round(random.uniform(50, 150), 1)
+        try:
+            return round(self.hx.get_weight(CONFIG["metingen_gemiddelde"]), 1)
+        except Exception as e:
+            log.error(f"Fout bij lezen gewicht: {e}")
+            return None
+
+# ================================================================
+#  INA219 WRAPPER
+# ================================================================
+class StroomMeter:
+    def __init__(self):
+        self.ina = None
+        self.beschikbaar = INA219_BESCHIKBAAR
+
+    def init(self):
+        if not self.beschikbaar:
+            return False
+        try:
+            self.ina = INA219(CONFIG["ina219_shunt_ohm"],
+                              address=CONFIG["ina219_adres"])
+            self.ina.configure()
+            log.info("INA219 geïnitialiseerd.")
+            return True
+        except Exception as e:
+            log.error(f"INA219 init fout: {e}")
+            self.beschikbaar = False
+            return False
+
+    def lees(self):
+        if not self.beschikbaar or self.ina is None:
+            return None, None
+        try:
+            return round(self.ina.voltage(), 3), round(self.ina.current(), 1)
+        except Exception as e:
+            log.error(f"INA219 leesfout: {e}")
+            return None, None
+
+# ================================================================
+#  TKINTER GUI
+# ================================================================
+class WeegschaalGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Battery Weegschaal + RC + Watt + Zonne-cyclus")
+        self.root.geometry("880x920")
+        self.root.minsize(780, 780)
+
+        self.weegschaal  = Weegschaal()
+        self.stroommeter = StroomMeter()
+        self.labels      = laad_json(LABELS_FILE, {})
+        self.teller      = 0
+        self.automatisch = tk.BooleanVar(value=False)
+        self.stop_flag   = threading.Event()
+        self.hx_live     = tk.BooleanVar(value=False)
+
+        self._updating = False
+        self._lock_watt = tk.BooleanVar(value=False)
+        self._lock_amp  = tk.BooleanVar(value=False)
+
+        self._bouw_interface()
+        self._initialiseer_hardware()
+        self.root.protocol("WM_DELETE_WINDOW", self._bij_sluiten)
+
+    # ------------------------------------------------------------
+    def _bouw_interface(self):
+        stijl = ttk.Style()
+        try:
+            stijl.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        for naam, bouwer in [
+            ("⚖  Wegen",                 self._bouw_tab_wegen),
+            ("🔧  HX711",                self._bouw_tab_hx711),
+            ("🔋  Batterij (RC + Watt)", self._bouw_tab_batterij),
+            ("☀  Oplaad / Ontlaad",      self._bouw_tab_zonne),
+            ("🏷  Labels",               self._bouw_tab_labels),
+        ]:
+            tab = ttk.Frame(notebook)
+            notebook.add(tab, text=naam)
+            bouwer(tab)
+
+        self.status = tk.StringVar(value="Klaar.")
+        ttk.Label(self.root, textvariable=self.status,
+                  relief="sunken", anchor="w").pack(fill="x", side="bottom")
+
+    # ------------------------------------------------------------
+    def _bouw_tab_wegen(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Gemeten gewicht",
+                  font=("Helvetica", 12)).grid(row=0, column=0,
+                                               columnspan=3, sticky="w")
+        self.gewicht_var = tk.StringVar(value="— g")
+        tk.Label(frame, textvariable=self.gewicht_var,
+                 font=("Helvetica", 42, "bold"),
+                 fg="#007700").grid(row=1, column=0, columnspan=3,
+                                    pady=(0, 12))
+
+        ttk.Label(frame, text="Classificatie",
+                  font=("Helvetica", 12)).grid(row=2, column=0, sticky="w")
+        self.classificatie_var = tk.StringVar(value="Onbekend")
+        tk.Label(frame, textvariable=self.classificatie_var,
+                 font=("Helvetica", 22, "bold"),
+                 fg="#0055aa").grid(row=3, column=0, columnspan=3,
+                                    pady=(0, 12))
+
+        ttk.Button(frame, text="Meting uitvoeren (HX711)",
+                   command=self.doe_meting).grid(row=4, column=0,
+                                                 padx=4, pady=4, sticky="ew")
+        ttk.Checkbutton(frame, text="Automatisch meten",
+                        variable=self.automatisch,
+                        command=self._toggle_auto).grid(row=4, column=1,
+                                                        padx=4, pady=4)
+        ttk.Button(frame, text="Tarreer (nul)",
+                   command=self.tarreer).grid(row=4, column=2,
+                                              padx=4, pady=4, sticky="ew")
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=5, column=0, columnspan=3, sticky="ew", pady=10)
+
+        handmatig_frame = ttk.LabelFrame(frame,
+                                         text="Handmatige gewichtsinvoer",
+                                         padding=8)
+        handmatig_frame.grid(row=6, column=0, columnspan=3,
+                             sticky="ew", pady=6)
+
+        ttk.Label(handmatig_frame, text="Gewicht (g):").grid(
+            row=0, column=0, sticky="e", padx=4)
+        self.handmatig_gewicht_entry = ttk.Entry(handmatig_frame, width=15)
+        self.handmatig_gewicht_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Button(handmatig_frame, text="Gebruik deze waarde",
+                   command=self.gebruik_handmatig_gewicht).grid(
+            row=0, column=2, padx=4)
+        ttk.Button(handmatig_frame, text="Classificeer",
+                   command=self.classificeer_handmatig).grid(
+            row=0, column=3, padx=4)
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=10)
+
+        ttk.Label(frame, text="Nieuw teststuk toevoegen",
+                  font=("Helvetica", 12)).grid(row=8, column=0,
+                                               columnspan=3, sticky="w")
+        ttk.Label(frame, text="Naam:").grid(row=9, column=0, sticky="e")
+        self.nieuw_label_entry = ttk.Entry(frame, width=30)
+        self.nieuw_label_entry.grid(row=9, column=1, sticky="ew", padx=4)
+        ttk.Button(frame, text="Opslaan",
+                   command=self.sla_nieuw_label_op).grid(row=9, column=2,
+                                                         padx=4, sticky="ew")
+
+        frame.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------
+    def _bouw_tab_hx711(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        status_frame = ttk.LabelFrame(frame, text="Status", padding=8)
+        status_frame.grid(row=0, column=0, columnspan=2,
+                          sticky="ew", pady=6)
+
+        self.hx_status_var = tk.StringVar(value="Onbekend")
+        ttk.Label(status_frame, text="Verbinding:",
+                  font=("Helvetica", 10, "bold")).grid(row=0, column=0,
+                                                       sticky="e", padx=4)
+        ttk.Label(status_frame, textvariable=self.hx_status_var).grid(
+            row=0, column=1, sticky="w", padx=4)
+
+        self.hx_unit_var = tk.StringVar(value="—")
+        ttk.Label(status_frame, text="Referentie-unit:",
+                  font=("Helvetica", 10, "bold")).grid(row=1, column=0,
+                                                       sticky="e", padx=4)
+        ttk.Label(status_frame, textvariable=self.hx_unit_var).grid(
+            row=1, column=1, sticky="w", padx=4)
+
+        self.hx_pin_var = tk.StringVar(
+            value=f"DT=GPIO{CONFIG['dout_pin']}, SCK=GPIO{CONFIG['sck_pin']}")
+        ttk.Label(status_frame, text="Pinnen:",
+                  font=("Helvetica", 10, "bold")).grid(row=2, column=0,
+                                                       sticky="e", padx=4)
+        ttk.Label(status_frame, textvariable=self.hx_pin_var).grid(
+            row=2, column=1, sticky="w", padx=4)
+
+        ruw_frame = ttk.LabelFrame(frame, text="Ruwe HX711-waarde",
+                                   padding=8)
+        ruw_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=6)
+
+        self.hx_ruw_var = tk.StringVar(value="—")
+        tk.Label(ruw_frame, textvariable=self.hx_ruw_var,
+                 font=("Courier", 20, "bold"),
+                 fg="#884400").pack(side="left", padx=8)
+
+        ttk.Checkbutton(ruw_frame, text="Live uitlezen (1 s)",
+                        variable=self.hx_live,
+                        command=self._toggle_hx_live).pack(side="left", padx=8)
+
+        ttk.Button(ruw_frame, text="Lees nu",
+                   command=self.lees_ruwe_waarde).pack(side="left", padx=8)
+
+        tare_frame = ttk.LabelFrame(frame, text="Nulpunt (tare)", padding=8)
+        tare_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=6)
+
+        ttk.Label(tare_frame,
+                  text="Verwijder alle gewicht en klik:").pack(side="left", padx=4)
+        ttk.Button(tare_frame, text="Tarreer nu",
+                   command=self.tarreer).pack(side="left", padx=8)
+
+        kal_frame = ttk.LabelFrame(frame, text="Kalibratie-wizard", padding=8)
+        kal_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
+
+        for i, txt in enumerate([
+            "Stap 1: Plaats een bekend gewicht op de weegschaal.",
+            "Stap 2: Voer het gewicht in gram in.",
+            "Stap 3: Klik op 'Kalibreer'.",
+        ]):
+            ttk.Label(kal_frame, text=txt,
+                      font=("Helvetica", 10)).grid(row=i, column=0,
+                                                   columnspan=2, sticky="w")
+
+        ttk.Label(kal_frame, text="Bekend gewicht (g):",
+                  font=("Helvetica", 10, "bold")).grid(row=3, column=0,
+                                                       sticky="e", padx=4, pady=8)
+        self.kalibratie_entry = ttk.Entry(kal_frame, width=15)
+        self.kalibratie_entry.grid(row=3, column=1, sticky="w", padx=4, pady=8)
+
+        ttk.Button(kal_frame, text="Kalibreer",
+                   command=self.kalibreer_vanuit_gui).grid(
+            row=4, column=0, columnspan=2, pady=8, sticky="ew")
+
+        pin_frame = ttk.LabelFrame(frame,
+                                   text="Pin-configuratie (geavanceerd)",
+                                   padding=8)
+        pin_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=6)
+
+        ttk.Label(pin_frame, text="DT (GPIO):").grid(row=0, column=0,
+                                                     sticky="e", padx=4)
+        self.dout_entry = ttk.Entry(pin_frame, width=8)
+        self.dout_entry.insert(0, str(CONFIG["dout_pin"]))
+        self.dout_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(pin_frame, text="SCK (GPIO):").grid(row=0, column=2,
+                                                      sticky="e", padx=4)
+        self.sck_entry = ttk.Entry(pin_frame, width=8)
+        self.sck_entry.insert(0, str(CONFIG["sck_pin"]))
+        self.sck_entry.grid(row=0, column=3, sticky="w", padx=4)
+
+        ttk.Button(pin_frame, text="Herinitialiseer HX711",
+                   command=self.herinitialiseer_hx711).grid(
+            row=1, column=0, columnspan=4, pady=8, sticky="ew")
+
+        frame.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------
+    def _bouw_tab_batterij(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Startspanning V₀ (V):").grid(
+            row=0, column=0, sticky="e", pady=3)
+        self.v0_entry = ttk.Entry(frame, width=15)
+        self.v0_entry.insert(0, str(CONFIG["batterij_voltage_nom"]))
+        self.v0_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(frame, text="Drempelspanning V_min (V):").grid(
+            row=1, column=0, sticky="e", pady=3)
+        self.vmin_entry = ttk.Entry(frame, width=15)
+        self.vmin_entry.insert(0, str(CONFIG["batterij_voltage_min"]))
+        self.vmin_entry.grid(row=1, column=1, sticky="w", padx=4)
+
+        ttk.Label(frame, text="Capaciteit (mAh):").grid(
+            row=2, column=0, sticky="e", pady=3)
+        self.cap_entry = ttk.Entry(frame, width=15)
+        self.cap_entry.insert(0, str(CONFIG["batterij_capaciteit_mah"]))
+        self.cap_entry.grid(row=2, column=1, sticky="w", padx=4)
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=8)
+
+        koppel_frame = ttk.LabelFrame(
+            frame, text="Vermogen koppelen (Watt ⇄ Ampère)", padding=8)
+        koppel_frame.grid(row=4, column=0, columnspan=2,
+                          sticky="ew", pady=6)
+
+        ttk.Label(koppel_frame, text="Stroom (mA):",
+                  font=("Helvetica", 10, "bold")).grid(
+            row=0, column=0, sticky="e", padx=4, pady=3)
+        self.stroom_entry = ttk.Entry(koppel_frame, width=15)
+        self.stroom_entry.insert(0, "600")
+        self.stroom_entry.grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(koppel_frame, text="🔒 vast",
+                        variable=self._lock_amp,
+                        command=self._toggle_lock_amp).grid(
+            row=0, column=2, sticky="w", padx=4)
+
+        ttk.Label(koppel_frame, text="Vermogen (W):",
+                  font=("Helvetica", 10, "bold")).grid(
+            row=1, column=0, sticky="e", padx=4, pady=3)
+        self.watt_entry = ttk.Entry(koppel_frame, width=15)
+        self.watt_entry.insert(0, "3.000")
+        self.watt_entry.grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(koppel_frame, text="🔒 vast",
+                        variable=self._lock_watt,
+                        command=self._toggle_lock_watt).grid(
+            row=1, column=2, sticky="w", padx=4)
+
+        ttk.Label(koppel_frame,
+                  text="Wijzig één van beide — het andere veld wordt "
+                       "automatisch herberekend via V₀.\n"
+                       "Vink 🔒 aan om een waarde vast te zetten "
+                       "(stabilisatie bij spanningspieken).",
+                  font=("Helvetica", 9, "italic")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self.stroom_entry.bind("<FocusOut>", self._on_stroom_edit)
+        self.stroom_entry.bind("<Return>",   self._on_stroom_edit)
+        self.watt_entry.bind("<FocusOut>",   self._on_watt_edit)
+        self.watt_entry.bind("<Return>",     self._on_watt_edit)
+        self.v0_entry.bind("<FocusOut>",     self._herbereken_koppeling)
+        self.v0_entry.bind("<Return>",       self._herbereken_koppeling)
+
+        self.gebruik_ina = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Spanning en stroom automatisch meten via INA219 "
+                 "(uit = handmatige waarden)",
+            variable=self.gebruik_ina,
+            command=self._toggle_ina
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
+
+        watt_frame = ttk.LabelFrame(frame, text="Actueel verbruik",
+                                    padding=8)
+        watt_frame.grid(row=6, column=0, columnspan=2,
+                        sticky="ew", pady=6)
+
+        self.watt_var = tk.StringVar(value="— W")
+        tk.Label(watt_frame, textvariable=self.watt_var,
+                 font=("Helvetica", 28, "bold"),
+                 fg="#cc5500").pack(side="left", padx=8)
+
+        self.watt_detail_var = tk.StringVar(
+            value="(Vul V en I of P in, of gebruik INA219)")
+        ttk.Label(watt_frame, textvariable=self.watt_detail_var,
+                  font=("Helvetica", 10, "italic")).pack(side="left", padx=8)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=7, column=0, columnspan=2, pady=8, sticky="ew")
+
+        ttk.Button(btn_row, text="Bereken Watt (V × I)",
+                   command=self.bereken_watt_knop).pack(
+            side="left", padx=4, expand=True, fill="x")
+        ttk.Button(btn_row, text="Bereken RC + resterende tijd",
+                   command=self.bereken_batterij).pack(
+            side="left", padx=4, expand=True, fill="x")
+        ttk.Button(btn_row, text="Stabiliseer wattage",
+                   command=self.stabiliseer_wattage).pack(
+            side="left", padx=4, expand=True, fill="x")
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=10)
+
+        self.rc_tekst = tk.Text(frame, height=14, width=80,
+                                font=("Courier", 11), state="disabled",
+                                background="#f4f4f4")
+        self.rc_tekst.grid(row=9, column=0, columnspan=2, sticky="nsew")
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(9, weight=1)
+
+        self._toon_rc_resultaat(
+            "Koppeling Watt ⇄ Ampère:\n"
+            "  P = V × I          (Watt)\n"
+            "  I = P / V          (Ampère)\n\n"
+            "RC-formule:\n"
+            "  R = V / I\n"
+            "  C = (mAh × 3.6) / V\n"
+            "  τ = R · C\n"
+            "  t = −τ · ln(V_min / V₀)\n\n"
+            "Stabilisatie (België — stroompieken beperken):\n"
+            "  Zet Watt vast (🔒) → Ampère past zich aan bij\n"
+            "  spanningsvariaties, zodat P constant blijft."
+        )
+
+    # ------------------------------------------------------------
+    #  NIEUW TABBLAD: ZONNE-CYCLUS
+    # ------------------------------------------------------------
+    def _bouw_tab_zonne(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        # --- Batterij ---
+        bat_frame = ttk.LabelFrame(frame, text="Batterij", padding=8)
+        bat_frame.grid(row=0, column=0, columnspan=2,
+                       sticky="ew", pady=6)
+
+        ttk.Label(bat_frame, text="Capaciteit (Wh):").grid(
+            row=0, column=0, sticky="e", padx=4, pady=3)
+        self.bat_wh_entry = ttk.Entry(bat_frame, width=15)
+        self.bat_wh_entry.insert(0, f"{CONFIG['batterij_wh']:.1f}")
+        self.bat_wh_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(bat_frame,
+                  text="(1 Wh = 1000 mAh × 1 V; bv. 10.000 mAh × 3.7 V "
+                       "= 37 Wh)").grid(
+            row=0, column=2, columnspan=2, sticky="w", padx=4)
+
+        ttk.Label(bat_frame, text="Of capaciteit (mAh):").grid(
+            row=1, column=0, sticky="e", padx=4, pady=3)
+        self.bat_mah_entry = ttk.Entry(bat_frame, width=15)
+        self.bat_mah_entry.insert(0, str(CONFIG["batterij_capaciteit_mah"]))
+        self.bat_mah_entry.grid(row=1, column=1, sticky="w", padx=4)
+
+        ttk.Label(bat_frame, text="Nominale spanning (V):").grid(
+            row=1, column=2, sticky="e", padx=4, pady=3)
+        self.bat_v_entry = ttk.Entry(bat_frame, width=10)
+        self.bat_v_entry.insert(0, "3.7")
+        self.bat_v_entry.grid(row=1, column=3, sticky="w", padx=4)
+
+        ttk.Button(bat_frame, text="Wh uit mAh × V",
+                   command=self.bereken_wh_uit_mah).grid(
+            row=2, column=0, columnspan=4, pady=6, sticky="ew")
+
+        # --- Laden ---
+        laad_frame = ttk.LabelFrame(frame, text="Laden (zonnepaneel)",
+                                    padding=8)
+        laad_frame.grid(row=1, column=0, columnspan=2,
+                        sticky="ew", pady=6)
+
+        ttk.Label(laad_frame, text="Laadvermogen (W):").grid(
+            row=0, column=0, sticky="e", padx=4, pady=3)
+        self.laad_w_entry = ttk.Entry(laad_frame, width=15)
+        self.laad_w_entry.insert(0, f"{CONFIG['laad_vermogen_w']:.1f}")
+        self.laad_w_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(laad_frame, text="Rendement (%):").grid(
+            row=0, column=2, sticky="e", padx=4, pady=3)
+        self.laad_rend_entry = ttk.Entry(laad_frame, width=10)
+        self.laad_rend_entry.insert(0, "85")
+        self.laad_rend_entry.grid(row=0, column=3, sticky="w", padx=4)
+
+        ttk.Label(laad_frame, text="Effectieve zonuren/dag:").grid(
+            row=1, column=0, sticky="e", padx=4, pady=3)
+        self.zon_uren_entry = ttk.Entry(laad_frame, width=15)
+        self.zon_uren_entry.insert(0, f"{CONFIG['zon_uren_per_dag']:.1f}")
+        self.zon_uren_entry.grid(row=1, column=1, sticky="w", padx=4)
+
+        ttk.Label(laad_frame,
+                  text="(België: reken op 3-4 u in de winter, 6-8 u in de "
+                       "zomer)").grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=4)
+
+        # --- Ontladen ---
+        ontlaad_frame = ttk.LabelFrame(frame, text="Ontladen (verbruiker)",
+                                       padding=8)
+        ontlaad_frame.grid(row=2, column=0, columnspan=2,
+                           sticky="ew", pady=6)
+
+        ttk.Label(ontlaad_frame, text="Ontlaadvermogen (W):").grid(
+            row=0, column=0, sticky="e", padx=4, pady=3)
+        self.ontlaad_w_entry = ttk.Entry(ontlaad_frame, width=15)
+        self.ontlaad_w_entry.insert(0, f"{CONFIG['ontlaad_vermogen_w']:.1f}")
+        self.ontlaad_w_entry.grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Button(ontlaad_frame,
+                   text="Neem Watt over van batterij-tabblad",
+                   command=self.neem_watt_over).grid(
+            row=0, column=2, columnspan=2, padx=4, sticky="w")
+
+        # --- Actie-knop ---
+        ttk.Button(frame, text="▶  Bereken oplaadtijd + ontlaadtijd + dagbalans",
+                   command=self.bereken_zonne_cyclus).grid(
+            row=3, column=0, columnspan=2, pady=10, sticky="ew")
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=6)
+
+        # --- Resultaat ---
+        self.zonne_tekst = tk.Text(frame, height=18, width=84,
+                                   font=("Courier", 11), state="disabled",
+                                   background="#f4f4f4")
+        self.zonne_tekst.grid(row=5, column=0, columnspan=2, sticky="nsew")
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(5, weight=1)
+
+        self._toon_zonne_resultaat(
+            "Vul de gegevens in en klik op 'Bereken oplaadtijd + "
+            "ontlaadtijd + dagbalans'.\n\n"
+            "Formules:\n"
+            "  E (Wh)       = mAh × V / 1000\n"
+            "  t_laad (u)   = E / (P_laad × η)\n"
+            "  t_ontlaad (u)= E / P_ontlaad\n"
+            "  E_zonnedag   = P_laad × zonuren × η\n"
+            "  E_verbruik   = P_ontlaad × 24 u\n"
+            "  Netto balans = E_zonnedag − E_verbruik\n"
+        )
+
+    # ------------------------------------------------------------
+    def _bouw_tab_labels(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Opgeslagen teststukken",
+                  font=("Helvetica", 12)).pack(anchor="w")
+
+        kolommen = ("label", "gewicht", "datum")
+        self.labels_tree = ttk.Treeview(frame, columns=kolommen,
+                                        show="headings", height=14)
+        self.labels_tree.heading("label",   text="Naam")
+        self.labels_tree.heading("gewicht", text="Gewicht (g)")
+        self.labels_tree.heading("datum",   text="Toegevoegd")
+        self.labels_tree.column("label",   width=200)
+        self.labels_tree.column("gewicht", width=100, anchor="e")
+        self.labels_tree.column("datum",   width=180)
+        self.labels_tree.pack(fill="both", expand=True, pady=8)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="Verwijder geselecteerde",
+                   command=self.verwijder_label).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Ververs",
+                   command=self._vul_labels_tabel).pack(side="left", padx=4)
+
+        self._vul_labels_tabel()
+
+    # ============================================================
+    #  ZONNE-CYCLUS BEREKENINGEN
+    # ============================================================
+    def _lees_float(self, entry, naam):
+        try:
+            return float(entry.get().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Invoerfout",
+                                 f"Ongeldige waarde voor {naam}.")
+            return None
+
+    def bereken_wh_uit_mah(self):
+        mah = self._lees_float(self.bat_mah_entry, "mAh")
+        v   = self._lees_float(self.bat_v_entry, "nominale spanning")
+        if mah is None or v is None:
+            return
+        wh = mah_naar_wh(mah, v)
+        self.bat_wh_entry.delete(0, tk.END)
+        self.bat_wh_entry.insert(0, f"{wh:.2f}")
+        self.status.set(f"Batterij: {mah:.0f} mAh × {v:.2f} V = {wh:.2f} Wh")
+        log.info(f"Wh-omrekening: {mah} mAh × {v} V = {wh:.2f} Wh")
+
+    def neem_watt_over(self):
+        """Neemt het wattage over uit het batterij-tabblad."""
+        try:
+            watt = float(self.watt_entry.get().replace(",", "."))
+        except ValueError:
+            messagebox.showwarning("Wattage",
+                                   "Geen geldig wattage in batterij-tabblad.")
+            return
+        self.ontlaad_w_entry.delete(0, tk.END)
+        self.ontlaad_w_entry.insert(0, f"{watt:.3f}")
+        self.status.set(f"Ontlaadvermogen overgenomen: {watt:.3f} W")
+
+    def bereken_zonne_cyclus(self):
+        # Invoer lezen
+        wh        = self._lees_float(self.bat_wh_entry,      "batterij Wh")
+        p_laad    = self._lees_float(self.laad_w_entry,      "laadvermogen")
+        rend_pct  = self._lees_float(self.laad_rend_entry,   "rendement")
+        zon_uren  = self._lees_float(self.zon_uren_entry,    "zonuren")
+        p_ontlaad = self._lees_float(self.ontlaad_w_entry,   "ontlaadvermogen")
+        if None in (wh, p_laad, rend_pct, zon_uren, p_ontlaad):
+            return
+
+        if wh <= 0 or p_laad <= 0 or p_ontlaad <= 0 or zon_uren <= 0:
+            messagebox.showerror("Invoerfout",
+                                 "Alle waarden moeten > 0 zijn.")
+            return
+        if not (0 < rend_pct <= 100):
+            messagebox.showerror("Invoerfout",
+                                 "Rendement moet tussen 0 en 100 % liggen.")
+            return
+
+        rend = rend_pct / 100.0
+
+        # Berekeningen
+        t_laad_u    = oplaadtijd_uren(wh, p_laad, rend)
+        t_ontlaad_u = ontlaadtijd_uren(wh, p_ontlaad)
+
+        energie_per_dag = p_laad * zon_uren * rend        # Wh/dag
+        verbruik_dag    = p_ontlaad * 24.0                # Wh/dag
+        netto           = energie_per_dag - verbruik_dag
+
+        # Hoe vaak past een volledige cyclus in 24 u?
+        cyclus_uren = t_laad_u + t_ontlaad_u
+        cycli_per_dag = 24.0 / cyclus_uren if cyclus_uren > 0 else 0
+
+        # Hoeveel uur zon nodig om batterij vol te laden?
+        uren_vol = t_laad_u
+
+        # Conclusie
+        if netto > 0:
+            conclusie = (f"✅ Je wint {netto:.1f} Wh per dag — "
+                         f"de batterij raakt vol.")
+        elif netto < 0:
+            conclusie = (f"⚠  Je verliest {abs(netto):.1f} Wh per dag — "
+                         f"de batterij raakt leeg.")
+        else:
+            conclusie = "⚖  Perfect in balans (netto = 0 Wh/dag)."
+
+        tekst = (
+            f"── BATTERIJ ─────────────────────────────────\n"
+            f"  Energie inhoud          : {wh:.2f} Wh\n"
+            f"  (equivalent in mAh × V) : "
+            f"{wh_naar_mah(wh, 3.7):.0f} mAh @ 3.7 V\n\n"
+            f"── LADEN (zonnepaneel) ─────────────────────\n"
+            f"  Laadvermogen            : {p_laad:.2f} W\n"
+            f"  Rendement               : {rend_pct:.1f} % "
+            f"(η = {rend:.2f})\n"
+            f"  Effectieve zonuren/dag  : {zon_uren:.1f} u\n"
+            f"  ► Oplaadtijd van leeg → vol:\n"
+            f"      t = E / (P × η) = {wh:.2f} / "
+            f"({p_laad:.2f} × {rend:.2f})\n"
+            f"      = {t_laad_u:.3f} u   ({formatteer_uren(t_laad_u)})\n"
+            f"  ► Energie per zonnige dag:\n"
+            f"      E = {p_laad:.2f} × {zon_uren:.1f} × {rend:.2f}\n"
+            f"      = {energie_per_dag:.2f} Wh/dag\n\n"
+            f"── ONTLADEN (verbruiker) ───────────────────\n"
+            f"  Ontlaadvermogen         : {p_ontlaad:.2f} W\n"
+            f"  ► Ontlaadtijd van vol → leeg:\n"
+            f"      t = E / P = {wh:.2f} / {p_ontlaad:.2f}\n"
+            f"      = {t_ontlaad_u:.3f} u   ({formatteer_uren(t_ontlaad_u)})\n"
+            f"  ► Verbruik per etmaal:\n"
+            f"      E = {p_ontlaad:.2f} × 24 = {verbruik_dag:.2f} Wh/dag\n\n"
+            f"── DAGBALANS (24 u) ────────────────────────\n"
+            f"  Opbrengst (zon)   : +{energie_per_dag:.2f} Wh\n"
+            f"  Verbruik          : −{verbruik_dag:.2f} Wh\n"
+            f"  ────────────────────────────────\n"
+            f"  Netto             : {netto:+.2f} Wh/dag\n\n"
+            f"  {conclusie}\n\n"
+            f"── CYCLUS-ANALYSE ──────────────────────────\n"
+            f"  Duur 1 volledige cyclus : {cyclus_uren:.2f} u "
+            f"(laden + ontladen)\n"
+            f"  Cycli per etmaal        : {cycli_per_dag:.2f}×\n"
+            f"  Uren zon nodig voor vol : {uren_vol:.2f} u\n"
+        )
+        self._toon_zonne_resultaat(tekst)
+        self.status.set(f"Netto dagbalans: {netto:+.2f} Wh/dag "
+                        f"(oplaadtijd {formatteer_uren(t_laad_u)}, "
+                        f"ontlaadtijd {formatteer_uren(t_ontlaad_u)})")
+        log.info(f"Zonne-cyclus: E={wh:.2f}Wh Plaad={p_laad}W "
+                 f"Pontlaad={p_ontlaad}W η={rend} zon={zon_uren}u "
+                 f"→ t_laad={t_laad_u:.2f}u t_ontlaad={t_ontlaad_u:.2f}u "
+                 f"netto={netto:+.2f}Wh/dag")
+
+    def _toon_zonne_resultaat(self, tekst):
+        self.zonne_tekst.config(state="normal")
+        self.zonne_tekst.delete("1.0", tk.END)
+        self.zonne_tekst.insert("1.0", tekst)
+        self.zonne_tekst.config(state="disabled")
+
+    # ============================================================
+    #  KOPPELING WATT <-> AMPÈRE
+    # ============================================================
+    def _lees_v0_veilig(self):
+        try:
+            return float(self.v0_entry.get().replace(",", "."))
+        except ValueError:
+            return None
+
+    def _on_stroom_edit(self, event=None):
+        if self._updating or self._lock_watt.get():
+            return
+        v = self._lees_v0_veilig()
+        if v is None or v <= 0:
+            return
+        try:
+            i = float(self.stroom_entry.get().replace(",", "."))
+        except ValueError:
+            return
+        if i < 0:
+            return
+        watt = bereken_watt(v, i)
+        self._updating = True
+        self.watt_entry.delete(0, tk.END)
+        self.watt_entry.insert(0, f"{watt:.3f}")
+        self._updating = False
+        self._update_live_watt(v, i, watt)
+
+    def _on_watt_edit(self, event=None):
+        if self._updating or self._lock_amp.get():
+            return
+        v = self._lees_v0_veilig()
+        if v is None or v <= 0:
+            return
+        try:
+            p = float(self.watt_entry.get().replace(",", "."))
+        except ValueError:
+            return
+        if p < 0:
+            return
+        i = bereken_stroom_ma(v, p)
+        self._updating = True
+        self.stroom_entry.delete(0, tk.END)
+        self.stroom_entry.insert(0, f"{i:.1f}")
+        self._updating = False
+        self._update_live_watt(v, i, p)
+
+    def _herbereken_koppeling(self, event=None):
+        if self._updating:
+            return
+        v = self._lees_v0_veilig()
+        if v is None or v <= 0:
+            return
+        if self._lock_watt.get():
+            self._on_watt_edit()
+        elif self._lock_amp.get():
+            self._on_stroom_edit()
+
+    def _toggle_lock_watt(self):
+        if self._lock_watt.get():
+            self._lock_amp.set(False)
+            self.status.set("Wattage VAST — Ampère past zich aan bij "
+                            "spanningspieken.")
+        else:
+            self.status.set("Wattage niet meer vast.")
+
+    def _toggle_lock_amp(self):
+        if self._lock_amp.get():
+            self._lock_watt.set(False)
+            self.status.set("Ampère VAST — Watt past zich aan bij "
+                            "spanningspieken.")
+        else:
+            self.status.set("Ampère niet meer vast.")
+
+    def _update_live_watt(self, v, i, watt):
+        self.watt_var.set(f"{watt:.3f} W")
+        self.watt_detail_var.set(
+            f"= {v:.3f} V × {i:.1f} mA ({i/1000:.3f} A)"
+        )
+
+    # ------------------------------------------------------------
+    def stabiliseer_wattage(self):
+        v0 = self._lees_v0_veilig()
+        if v0 is None or v0 <= 0:
+            messagebox.showerror("Invoerfout", "Ongeldige V₀.")
+            return
+        try:
+            p = float(self.watt_entry.get().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Invoerfout", "Ongeldig wattage.")
+            return
+        if p <= 0:
+            messagebox.showerror("Invoerfout", "Wattage moet > 0 zijn.")
+            return
+
+        spanningen = [v0, v0 * 0.98, v0 * 0.96, v0 * 0.94, v0 * 0.92]
+        regels = [
+            "── WATTAGE-STABILISATIE ────────────────────",
+            f"Doelvermogen: {p:.3f} W",
+            "",
+            f"{'Spanning (V)':<15}{'Stroom (mA)':<15}{'Stroom (A)':<12}",
+            "-" * 45,
+        ]
+        max_i = 0.0
+        for v in spanningen:
+            i = bereken_stroom_ma(v, p)
+            max_i = max(max_i, i)
+            regels.append(f"{v:<15.3f}{i:<15.1f}{i/1000:<12.3f}")
+
+        regels.append("-" * 45)
+        regels.append(f"Maximale stroom bij laagste V: {max_i:.1f} mA "
+                      f"({max_i/1000:.3f} A)")
+        regels.append("")
+        regels.append("Tip: begrens je voeding tot deze maximale stroom ")
+        regels.append("     om spanningspieken (en je factuur) te beperken.")
+        tekst = "\n".join(regels)
+        self._toon_rc_resultaat(tekst)
+
+        self._lock_watt.set(True)
+        self._lock_amp.set(False)
+        self.status.set(f"Wattage {p:.3f} W gestabiliseerd — "
+                        f"max {max_i:.1f} mA bij {spanningen[-1]:.3f} V.")
+        log.info(f"Stabilisatie: P={p:.3f}W max I={max_i:.1f}mA")
+
+    # ------------------------------------------------------------
+    def _initialiseer_hardware(self):
+        if self.weegschaal.beschikbaar:
+            if self.weegschaal.init():
+                self.hx_status_var.set("✅ Verbonden")
+                if not self.weegschaal.laad_kalibratie():
+                    self.hx_unit_var.set("— (nog niet gekalibreerd)")
+                    self.status.set("Kalibratie nodig — zie HX711-tabblad.")
+                else:
+                    self.hx_unit_var.set(f"{self.weegschaal.referentie_unit:.4f}")
+            else:
+                self.hx_status_var.set("❌ Niet gevonden")
+                self.status.set("HX711 niet gevonden — DEMO-modus actief.")
+        else:
+            self.hx_status_var.set("❌ Module niet geïnstalleerd")
+            self.status.set("hx711 niet geïnstalleerd — DEMO-modus actief.")
+
+        if self.stroommeter.beschikbaar:
+            self.stroommeter.init()
+
+        self._vul_labels_tabel()
+
+    # ============================================================
+    #  HX711 TAB-FUNCTIES
+    # ============================================================
+    def lees_ruwe_waarde(self):
+        if self.weegschaal.hx is None:
+            self.hx_ruw_var.set("— (DEMO)")
+            return
+        try:
+            waarde = self.weegschaal.hx.get_value(3)
+            self.hx_ruw_var.set(f"{waarde}")
+        except Exception as e:
+            self.hx_ruw_var.set(f"Fout: {e}")
+
+    def _toggle_hx_live(self):
+        if self.hx_live.get():
+            threading.Thread(target=self._hx_live_lus, daemon=True).start()
+            self.status.set("Live HX711-uitlezing gestart.")
+        else:
+            self.status.set("Live HX711-uitlezing gestopt.")
+
+    def _hx_live_lus(self):
+        while self.hx_live.get() and not self.stop_flag.is_set():
+            self.root.after(0, self.lees_ruwe_waarde)
+            for _ in range(10):
+                if not self.hx_live.get() or self.stop_flag.is_set():
+                    return
+                time.sleep(0.1)
+
+    def herinitialiseer_hx711(self):
+        try:
+            dout = int(self.dout_entry.get())
+            sck  = int(self.sck_entry.get())
+        except ValueError:
+            messagebox.showerror("Fout", "Pinnen moeten gehele getallen zijn.")
+            return
+        self.weegschaal = Weegschaal()
+        if self.weegschaal.init(dout, sck):
+            self.hx_status_var.set("✅ Verbonden (nieuwe pinnen)")
+            self.hx_pin_var.set(f"DT=GPIO{dout}, SCK=GPIO{sck}")
+            if self.weegschaal.laad_kalibratie():
+                self.hx_unit_var.set(f"{self.weegschaal.referentie_unit:.4f}")
+            else:
+                self.hx_unit_var.set("— (nog niet gekalibreerd)")
+            messagebox.showinfo("HX711",
+                                f"HX711 geherinitialiseerd op "
+                                f"DT=GPIO{dout}, SCK=GPIO{sck}.")
+        else:
+            self.hx_status_var.set("❌ Herinitialisatie mislukt")
+            messagebox.showerror("Fout", "HX711 kon niet geïnitialiseerd worden.")
+
+    # ============================================================
+    #  WEGEN
+    # ============================================================
+    def doe_meting(self):
+        gewicht = self.weegschaal.lees()
+        if gewicht is None:
+            self.status.set("Fout bij lezen gewicht.")
+            return
+        self.teller += 1
+        self.gewicht_var.set(f"{gewicht:.1f} g")
+
+        label, verschil = self._classificeer(gewicht)
+        if verschil is not None and label != "Onbekend":
+            self.classificatie_var.set(f"{label}  (Δ {verschil:.1f} g)")
+        else:
+            self.classificatie_var.set(label)
+
+        log_meting(f"gewicht={gewicht}g\tlabel={label}")
+        self.status.set(f"Meting #{self.teller} voltooid om "
+                        f"{datetime.now().strftime('%H:%M:%S')}")
+
+    def gebruik_handmatig_gewicht(self):
+        tekst = self.handmatig_gewicht_entry.get().strip().replace(",", ".")
+        if not tekst:
+            messagebox.showwarning("Invoer", "Voer een gewicht in gram in.")
+            return
+        try:
+            gewicht = float(tekst)
+        except ValueError:
+            messagebox.showerror("Fout", f"'{tekst}' is geen geldig getal.")
+            return
+        if gewicht < 0:
+            messagebox.showerror("Fout", "Gewicht kan niet negatief zijn.")
+            return
+
+        self.teller += 1
+        self.gewicht_var.set(f"{gewicht:.1f} g")
+        self.status.set(f"Handmatige waarde overgenomen: {gewicht:.1f} g")
+        log.info(f"Handmatige gewichtsinvoer: {gewicht} g")
+
+    def classificeer_handmatig(self):
+        tekst = self.handmatig_gewicht_entry.get().strip().replace(",", ".")
+        if not tekst:
+            messagebox.showwarning("Invoer", "Voer eerst een gewicht in.")
+            return
+        try:
+            gewicht = float(tekst)
+        except ValueError:
+            messagebox.showerror("Fout", f"'{tekst}' is geen geldig getal.")
+            return
+
+        self.gewicht_var.set(f"{gewicht:.1f} g")
+        label, verschil = self._classificeer(gewicht)
+        if verschil is not None and label != "Onbekend":
+            self.classificatie_var.set(f"{label}  (Δ {verschil:.1f} g)")
+        else:
+            self.classificatie_var.set(label)
+
+        log_meting(f"handmatig={gewicht}g\tlabel={label}")
+        self.status.set(f"Handmatige classificatie: {label}")
+
+    def kalibreer_vanuit_gui(self):
+        if self.weegschaal.hx is None:
+            messagebox.showwarning("Kalibratie",
+                                   "Geen HX711 beschikbaar (DEMO-modus).")
+            return
+        tekst = self.kalibratie_entry.get().strip().replace(",", ".")
+        if not tekst:
+            messagebox.showwarning("Kalibratie",
+                                   "Voer een bekend gewicht in gram in.")
+            return
+        try:
+            bekend = float(tekst)
+        except ValueError:
+            messagebox.showerror("Fout", f"'{tekst}' is geen geldig getal.")
+            return
+        if bekend <= 0:
+            messagebox.showerror("Fout", "Gewicht moet groter dan 0 zijn.")
+            return
+
+        if self.weegschaal.kalibreer(bekend):
+            self.hx_unit_var.set(f"{self.weegschaal.referentie_unit:.4f}")
+            messagebox.showinfo("Kalibratie",
+                                f"Kalibratie voltooid met {bekend} g.\n"
+                                f"Referentie-unit: "
+                                f"{self.weegschaal.referentie_unit:.4f}")
+            self.status.set(f"Gekalibreerd op {bekend} g.")
+        else:
+            messagebox.showerror("Fout",
+                                 "Kalibratie mislukt. Controleer bedrading.")
+
+    def _classificeer(self, gewicht):
+        if not self.labels or gewicht is None:
+            return "Onbekend", None
+        beste_label    = "Onbekend"
+        beste_verschil = float("inf")
+        for label, waarde in self.labels.items():
+            verschil = abs(gewicht - waarde)
+            if verschil < beste_verschil:
+                beste_verschil = verschil
+                beste_label    = label
+        if beste_verschil <= CONFIG["tolerantie_gram"]:
+            return beste_label, beste_verschil
+        return "Onbekend", beste_verschil
+
+    def tarreer(self):
+        if self.weegschaal.hx is None:
+            self.status.set("Tarreer niet mogelijk (DEMO-modus).")
+            return
+        if self.weegschaal.tarreer():
+            self.status.set("Weegschaal op nul gezet.")
+        else:
+            self.status.set("Tarreerfout.")
+
+    def _toggle_auto(self):
+        if self.automatisch.get():
+            self.stop_flag.clear()
+            threading.Thread(target=self._auto_lus, daemon=True).start()
+            self.status.set("Automatisch meten gestart.")
+        else:
+            self.stop_flag.set()
+            self.status.set("Automatisch meten gestopt.")
+
+    def _auto_lus(self):
+        while not self.stop_flag.is_set() and self.automatisch.get():
+            self.root.after(0, self.doe_meting)
+            for _ in range(CONFIG["wacht_tussen_meten"] * 10):
+                if self.stop_flag.is_set() or not self.automatisch.get():
+                    return
+                time.sleep(0.1)
+
+    # ============================================================
+    #  LABELS
+    # ============================================================
+    def sla_nieuw_label_op(self):
+        naam = self.nieuw_label_entry.get().strip()
+        if not naam:
+            messagebox.showwarning("Naam", "Voer een naam in.")
+            return
+        try:
+            gewicht = float(self.gewicht_var.get().replace(" g", "")
+                            .replace(",", ".").strip())
+        except ValueError:
+            messagebox.showwarning("Gewicht",
+                                   "Voer eerst een geldige meting uit.")
+            return
+        self.labels[naam] = gewicht
+        sla_json_atomisch_op(LABELS_FILE, self.labels)
+        self.nieuw_label_entry.delete(0, tk.END)
+        self._vul_labels_tabel()
+        self.status.set(f"Label '{naam}' opgeslagen ({gewicht} g).")
+
+    def _vul_labels_tabel(self):
+        for item in self.labels_tree.get_children():
+            self.labels_tree.delete(item)
+        for naam, waarde in self.labels.items():
+            self.labels_tree.insert("", "end",
+                                    values=(naam, f"{waarde:.1f}", "—"))
+
+    def verwijder_label(self):
+        selectie = self.labels_tree.selection()
+        if not selectie:
+            return
+        for item in selectie:
+            naam = self.labels_tree.item(item)["values"][0]
+            self.labels.pop(naam, None)
+        sla_json_atomisch_op(LABELS_FILE, self.labels)
+        self._vul_labels_tabel()
+        self.status.set("Label(s) verwijderd.")
+
+    # ============================================================
+    #  BATTERIJ / WATT / RC
+    # ============================================================
+    def _toggle_ina(self):
+        if self.gebruik_ina.get() and not self.stroommeter.beschikbaar:
+            messagebox.showwarning(
+                "INA219",
+                "INA219 niet beschikbaar.\nInstalleer: pip3 install pi-ina219"
+            )
+            self.gebruik_ina.set(False)
+
+    def _lees_v_en_i(self):
+        try:
+            if self.gebruik_ina.get():
+                v, i = self.stroommeter.lees()
+                if v is None:
+                    raise ValueError("INA219 gaf geen waarde.")
+                self.stroom_entry.delete(0, tk.END)
+                self.stroom_entry.insert(0, f"{i:.1f}")
+                p = bereken_watt(v, i)
+                self.watt_entry.delete(0, tk.END)
+                self.watt_entry.insert(0, f"{p:.3f}")
+                return v, i
+            v = float(self.v0_entry.get().replace(",", "."))
+            i = float(self.stroom_entry.get().replace(",", "."))
+            return v, i
+        except ValueError as e:
+            messagebox.showerror("Invoerfout", f"Ongeldige waarde: {e}")
+            return None, None
+
+    def bereken_watt_knop(self):
+        v, i = self._lees_v_en_i()
+        if v is None:
+            return
+        if v <= 0 or i <= 0:
+            messagebox.showerror("Invoerfout",
+                                 "Spanning en stroom moeten > 0 zijn.")
+            return
+
+        watt = bereken_watt(v, i)
+        self._update_live_watt(v, i, watt)
+        self.watt_entry.delete(0, tk.END)
+        self.watt_entry.insert(0, f"{watt:.3f}")
+        self.status.set(f"Actueel verbruik: {watt:.3f} W")
+        log.info(f"Watt: P = {v:.3f} V × {i:.1f} mA = {watt:.3f} W")
+
+    def bereken_batterij(self):
+        v, i = self._lees_v_en_i()
+        if v is None:
+            return
+        try:
+            v0   = float(self.v0_entry.get().replace(",", "."))
+            vmin = float(self.vmin_entry.get().replace(",", "."))
+            cap  = float(self.cap_entry.get().replace(",", "."))
+            stroom_ma = i
+        except ValueError as e:
+            messagebox.showerror("Invoerfout", f"Ongeldige waarde: {e}")
+            return
+
+        if v0 <= 0 or vmin <= 0 or cap <= 0 or stroom_ma <= 0:
+            messagebox.showerror("Invoerfout", "Alle waarden moeten > 0 zijn.")
+            return
+        if vmin >= v0:
+            messagebox.showerror("Invoerfout",
+                                 "V_min moet kleiner zijn dan V₀.")
+            return
+
+        watt = bereken_watt(v0, stroom_ma)
+        self._update_live_watt(v0, stroom_ma, watt)
+        self.watt_entry.delete(0, tk.END)
+        self.watt_entry.insert(0, f"{watt:.3f}")
+
+        rc = bereken_rc(v0, stroom_ma, cap)
+        if rc is None:
+            messagebox.showerror("Fout", "RC-berekening mislukt.")
+            return
+
+        t_sec = resterende_tijd_seconden(v0, vmin, rc["tau"])
+        wh    = mah_naar_wh(cap, v0)
+
+        tekst = (
+            f"── INVOER ─────────────────────────────────\n"
+            f"  Startspanning V₀     : {v0:.3f} V\n"
+            f"  Drempelspanning V_min: {vmin:.3f} V\n"
+            f"  Capaciteit           : {cap:.0f} mAh "
+            f"({wh:.2f} Wh)\n"
+            f"  Stroom               : {stroom_ma:.1f} mA "
+            f"({stroom_ma/1000:.3f} A)\n\n"
+            f"── VERMOGEN (P = V × I) ───────────────────\n"
+            f"  P = {v0:.3f} × {stroom_ma/1000:.3f}\n"
+            f"    = {watt:.3f} W   ({watt*1000:.1f} mW)\n\n"
+            f"── RC-FORMULE ─────────────────────────────\n"
+            f"  R  = V / I           = {rc['R']:.2f} Ω\n"
+            f"  C  = (mAh × 3.6) / V = {rc['C']:.2f} F\n"
+            f"  τ  = R · C           = {rc['tau']:.2f} s "
+            f"({rc['tau']/3600:.3f} u)\n\n"
+            f"── RESTERENDE TIJD ────────────────────────\n"
+            f"  t = −τ · ln(V_min / V₀) = {t_sec:.2f} s\n"
+            f"  ► Resterende tijd: {formatteer_tijd(t_sec)}\n"
+            f"  ► Dat is {t_sec/3600:.2f} uur "
+            f"({t_sec/60:.1f} minuten)\n"
+            f"  ► Verbruik: {watt:.3f} W\n"
+        )
+        self._toon_rc_resultaat(tekst)
+        log.info(f"RC: V0={v0} Vmin={vmin} cap={cap} "
+                 f"I={stroom_ma}mA P={watt:.3f}W → t={t_sec:.1f}s")
+
+    def _toon_rc_resultaat(self, tekst):
+        self.rc_tekst.config(state="normal")
+        self.rc_tekst.delete("1.0", tk.END)
+        self.rc_tekst.insert("1.0", tekst)
+        self.rc_tekst.config(state="disabled")
+
+    # ------------------------------------------------------------
+    def _bij_sluiten(self):
+        self.stop_flag.set()
+        self.hx_live.set(False)
+        self.automatisch.set(False)
+        self.root.destroy()
+
+# ================================================================
+#  ENTRY POINT
+# ================================================================
+def main():
+    log.info("=" * 60)
+    log.info("BATTERY WEEGSCHAAL GUI gestart (met zonne-cyclus)")
+    log.info("=" * 60)
+
+    root = tk.Tk()
+    app = WeegschaalGUI(root)
+
+    def _stop(signum, frame):
+        log.info("Stop-signaal ontvangen.")
+        root.after(0, app._bij_sluiten)
+
+    signal.signal(signal.SIGINT,  _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    root.mainloop()
+    log.info("Programma netjes afgesloten.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"Onverwachte fout: {e}")
+        sys.exit(1)
